@@ -1,0 +1,110 @@
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class ToolError(BaseModel):
+    error_code: str = Field(description="Stable machine-readable error code")
+    message: str = Field(description="Human-readable error message")
+    suggestion: str | None = Field(default=None, description="Suggested next step")
+
+
+class ErrorResponse(BaseModel):
+    ok: Literal[False] = False
+    error: ToolError
+
+
+class ContactMethod(BaseModel):
+    label: str
+    value: str
+
+
+class ContactSummary(BaseModel):
+    contact_id: str
+    name: str
+    first_name: str = ""
+    last_name: str = ""
+    organization: str = ""
+    phone_count: int = 0
+    email_count: int = 0
+    phones: list[ContactMethod] = Field(default_factory=list)
+    emails: list[ContactMethod] = Field(default_factory=list)
+
+
+class HandleLookupResponse(BaseModel):
+    """Owners of Messages handles, keyed by the handle as given. Unresolved handles are absent."""
+
+    ok: Literal[True] = True
+    contacts: dict[str, ContactSummary] = Field(default_factory=dict)
+
+
+class ContactDetail(ContactSummary):
+    note: str = ""
+
+
+class HealthResponse(BaseModel):
+    ok: Literal[True] = True
+    server_name: str
+    version: str
+    safety_mode: str
+    safety_mode_warning: str | None = Field(default=None, description="Set when the configured safety value was invalid or blank and the server fell back to a safer mode")
+    transport: str = "stdio"
+    capabilities: list[str]
+    contacts_accessible: bool
+    permission_status: Literal["unknown", "authorized", "denied", "failed"] = "unknown"
+    permission_error_code: str | None = None
+    permission_error: str | None = None
+    permission_suggestion: str | None = None
+    # The app macOS checks for Contacts access: the app running this server, or the helper itself.
+    permission_client: str | None = None
+
+
+class ContactListResponse(BaseModel):
+    ok: Literal[True] = True
+    contacts: list[ContactSummary]
+    count: int
+
+
+class ContactResponse(BaseModel):
+    ok: Literal[True] = True
+    contact: ContactDetail
+
+
+class DuplicateEvidence(BaseModel):
+    kind: Literal["name", "nickname", "phone", "email"]
+    value: str
+
+
+class DuplicateCandidateGroup(BaseModel):
+    duplicate_group_id: str
+    confidence: float
+    evidence: list[DuplicateEvidence] = Field(default_factory=list)
+    contacts: list[ContactSummary] = Field(default_factory=list)
+    merge_recommended: bool = False
+
+
+class DuplicateContactListResponse(BaseModel):
+    ok: Literal[True] = True
+    groups: list[DuplicateCandidateGroup]
+    count: int
+
+
+class ResolvedRecipientResponse(BaseModel):
+    ok: Literal[True] = True
+    contact: ContactDetail
+    recipient_kind: Literal["phone", "email"]
+    recipient_label: str
+    recipient_value: str
+
+
+class CreateContactResponse(BaseModel):
+    ok: Literal[True] = True
+    contact_id: str
+    name: str
+    created: bool = True
+
+
+class DeleteContactResponse(BaseModel):
+    ok: Literal[True] = True
+    contact_id: str
+    deleted: bool

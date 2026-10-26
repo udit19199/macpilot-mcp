@@ -1,0 +1,800 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, Literal
+
+from macpilot_mcp.vendor_reed.contacts.config import load_settings
+from macpilot_mcp.vendor_reed.contacts.models import ContactDetail, ContactMethod, ContactSummary, CreateContactResponse, DeleteContactResponse, DuplicateCandidateGroup, DuplicateEvidence, ResolvedRecipientResponse
+from macpilot_mcp.vendor_reed.contacts.phone_matching import MIN_PHONE_DIGITS, is_email, normalize_email, normalize_phone, phone_parts, same_email, same_phone
+from macpilot_mcp.vendor_common.native import HelperBundle, NativeHelperError, ensure_helper_bundle, helper_bundle_executable
+
+METHOD_FIELD_SEPARATOR = "\x1f"
+METHOD_RECORD_SEPARATOR = "\x1e"
+NO_CHANGE_SENTINEL = "__NOCHANGE__"
+SCRIPT_TIMEOUT_SECONDS = 30
+# Name lookups decorate Messages reads; give up quickly instead of stalling them.
+LOOKUP_HANDLES_TIMEOUT_SECONDS = 5
+MAX_SCRIPT_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_CONTACTS_PER_REQUEST = 1000
+MAX_DIRECTORY_CONTACTS = 100_000
+
+# macOS only shows a Contacts prompt for an app whose Info.plist explains the access,
+# and remembers the answer by bundle identifier and signature.
+CONTACTS_HELPER_BUNDLE = HelperBundle(
+    executable="apple-contacts-bridge",
+    display_name="Apple Contacts MCP Helper",
+    bundle_identifier="io.github.jonathanrreed.apple-mcps.contacts-bridge",
+    usage_descriptions={
+        "NSContactsUsageDescription": "Apple Contacts MCP reads and manages contacts when your AI assistant asks it to.",
+    },
+)
+
+
+class ContactsBridgeError(Exception):
+    def __init__(self, error_code: str, message: str, suggestion: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.message = message
+        self.suggestion = suggestion
+
+
+class AppleContactsBridge:
+    def __init__(self, scripts_dir: Path, *, helper_source: Path | None = None, helper_build_dir: Path | None = None) -> None:
+        self.scripts_dir = scripts_dir
+        self.helper_source = helper_source
+        self.helper_build_dir = helper_build_dir
+        self._native_binary: Path | None = None
+        # The app macOS checked during the last permission_diagnostic, when the helper reports it.
+        self.permission_client: str | None = None
+
+    def permission_diagnostic(self) -> tuple[bool, ContactsBridgeError | None]:
+        if self.helper_source is None:
+            return False, ContactsBridgeError(
+                "AUTHORIZATION_UNKNOWN", "Contacts automation authorization has not been checked.",
+                "Use an explicit Contacts operation to check authorization.",
+            )
+        try:
+            payload = self._run_script("permission_check.applescript")
+            self.permission_client = str(payload["tcc_client"]) if payload.get("tcc_client") else None
+            if payload.get("status") not in {"authorized", "denied", "unknown"} or not isinstance(payload.get("accessible"), bool):
+                raise ContactsBridgeError("INVALID_SCRIPT_OUTPUT", "Contacts permission check returned an invalid status.")
+            if payload["status"] == "authorized" and payload["accessible"] is True:
+                return True, None
+            client = payload.get("tcc_client")
+            suggestion = payload.get("suggestion")
+            if payload.get("status") == "denied":
+                return False, ContactsBridgeError(
+                    "PERMISSION_DENIED", f"macOS denied Contacts access to '{client}'." if client else "macOS denied Contacts access.",
+                    str(suggestion) if suggestion else "Allow Contacts access in System Settings > Privacy & Security > Contacts.",
+                )
+            return False, ContactsBridgeError(
+                "AUTHORIZATION_UNKNOWN", "Contacts authorization has not been granted.",
+                str(suggestion) if suggestion else "Use an explicit Contacts operation to request access.",
+            )
+        except ContactsBridgeError as exc:
+            return False, exc
+
+    def helper_built(self) -> bool:
+        """Whether the native helper for this source is already compiled, without building it."""
+        if self.helper_source is None or self.helper_build_dir is None:
+            return False
+        try:
+            return helper_bundle_executable(self.helper_source, self.helper_build_dir, CONTACTS_HELPER_BUNDLE).is_file()
+        except OSError:
+            return False
+
+    def list_contacts(self, limit: int = MAX_CONTACTS_PER_REQUEST, offset: int = 0) -> list[ContactSummary]:
+        bounded_limit = max(1, min(limit, MAX_CONTACTS_PER_REQUEST))
+        payload = self._run_script("list_contacts.applescript", str(bounded_limit), str(max(0, offset)))
+        return [self._normalize_summary(item) for item in payload.get("items", []) if isinstance(item, dict)]
+
+    def get_contact(self, contact_id: str) -> ContactDetail:
+        payload = self._run_script("get_contact.applescript", contact_id)
+        if not payload.get("found", True):
+            raise ContactsBridgeError(
+                "CONTACT_NOT_FOUND",
+                f"No contact matched '{contact_id}'.",
+                "Search contacts first to discover a valid contact id.",
+            )
+        raw_contact = payload.get("contact")
+        if not isinstance(raw_contact, dict):
+            raise ContactsBridgeError(
+                "INVALID_SCRIPT_OUTPUT",
+                "The get_contact AppleScript did not return a contact object.",
+                "Inspect the AppleScript output and try again.",
+            )
+        return self._normalize_detail(raw_contact)
+
+    def search_contacts(self, query: str, limit: int = 25) -> list[ContactSummary]:
+        query_text = query.strip().lower()
+        if not query_text:
+            raise ContactsBridgeError("INVALID_INPUT", "query must not be empty", "Provide a non-empty name, phone number, or email address.")
+        bounded_limit = max(1, min(limit, 100))
+        phone_parts = self._phone_query_parts(query_text)
+        # An explicit extension query identifies a phone method, not a name.
+        direct_matches = [] if phone_parts and phone_parts[1] is not None else self._search_contacts_by_name(query, bounded_limit)
+        if direct_matches:
+            return direct_matches
+        normalized_query = self._normalize_lookup_value(query)
+        is_phone_query = phone_parts is not None
+        if "@" not in query_text and not is_phone_query:
+            return []
+        exact_matches: list[ContactSummary] = []
+        partial_matches: list[ContactSummary] = []
+        for contact in self._iter_all_contacts():
+            if self._is_exact_match(contact, query_text, normalized_query):
+                exact_matches.append(contact)
+                continue
+            if self._is_partial_match(contact, query_text, normalized_query):
+                partial_matches.append(contact)
+        ordered = self._dedupe_contacts([*exact_matches, *partial_matches])
+        return ordered[:bounded_limit]
+
+    def resolve_message_recipient(self, query: str, channel: str = "phone") -> ResolvedRecipientResponse:
+        if channel not in {"phone", "email", "any"}:
+            raise ContactsBridgeError("INVALID_INPUT", f"Unsupported channel '{channel}'.", "Use 'phone', 'email', or 'any'.")
+        # A complete email or phone names one method: only its exact owners count,
+        # never a contact whose stored value merely contains it.
+        matches = self._exact_method_matches(query)
+        if matches is None:
+            matches = self.search_contacts(query, limit=10)
+        elif not matches and self._is_short_code(query) and self.search_contacts(query, limit=1):
+            # A short code that only matches part of a stored number never picks a person.
+            raise ContactsBridgeError(
+                "AMBIGUOUS_PHONE_NUMBER",
+                f"'{query.strip()}' has fewer than {MIN_PHONE_DIGITS} digits and only matches part of a stored phone number.",
+                "Give the complete phone number, or use contacts_search_contacts and choose a specific contact_id.",
+            )
+        if not matches:
+            raise ContactsBridgeError("CONTACT_NOT_FOUND", f"No contact matched '{query}'.", "Search contacts first to discover a valid contact.")
+
+        query_text = query.strip().lower()
+        normalized_query = self._normalize_lookup_value(query)
+        exact_matches = [contact for contact in matches if self._is_exact_match(contact, query_text, normalized_query)]
+        if len(exact_matches) > 1:
+            raise ContactsBridgeError(
+                "AMBIGUOUS_CONTACT",
+                f"Multiple contacts matched '{query}'.",
+                "Use contacts_search_contacts first, then choose a specific contact_id.",
+            )
+        if len(exact_matches) == 1:
+            selected = exact_matches[0]
+        elif len(matches) == 1:
+            selected = matches[0]
+        else:
+            raise ContactsBridgeError(
+                "AMBIGUOUS_CONTACT",
+                f"Multiple contacts matched '{query}'.",
+                "Use contacts_search_contacts first, then choose a specific contact_id.",
+            )
+
+        detail = self.get_contact(selected.contact_id)
+        recipient_kind, recipient = self._choose_recipient(detail, channel, query=query)
+        return ResolvedRecipientResponse(
+            contact=detail,
+            recipient_kind=recipient_kind,
+            recipient_label=recipient.label,
+            recipient_value=recipient.value,
+        )
+
+    def create_contact(
+        self,
+        *,
+        first_name: str,
+        last_name: str = "",
+        organization: str = "",
+        phones: list[ContactMethod] | None = None,
+        emails: list[ContactMethod] | None = None,
+        note: str = "",
+    ) -> CreateContactResponse:
+        payload = self._run_script(
+            "create_contact.applescript",
+            first_name,
+            last_name,
+            organization,
+            self._serialize_methods(phones),
+            self._serialize_methods(emails),
+            note,
+        )
+        return CreateContactResponse(
+            contact_id=str(payload.get("contact_id", "")),
+            name=str(payload.get("name", "")),
+            created=bool(payload.get("created", True)),
+        )
+
+    def update_contact(
+        self,
+        contact_id: str,
+        *,
+        first_name: str = "",
+        last_name: str = "",
+        organization: str = "",
+        phones: list[ContactMethod] | None = None,
+        emails: list[ContactMethod] | None = None,
+        note: str = "",
+    ) -> ContactDetail:
+        payload = self._run_script(
+            "update_contact.applescript",
+            contact_id,
+            first_name,
+            last_name,
+            organization,
+            self._serialize_methods(phones) if phones is not None else NO_CHANGE_SENTINEL,
+            self._serialize_methods(emails) if emails is not None else NO_CHANGE_SENTINEL,
+            note,
+        )
+        if not payload.get("updated", False):
+            raise ContactsBridgeError(
+                "UPDATE_FAILED",
+                f"Failed to update contact '{contact_id}'.",
+                "Ensure the contact exists and try again.",
+            )
+        return self.get_contact(contact_id)
+
+    def delete_contact(self, contact_id: str) -> DeleteContactResponse:
+        payload = self._run_script("delete_contact.applescript", contact_id)
+        return DeleteContactResponse(
+            contact_id=contact_id,
+            deleted=bool(payload.get("deleted", False)),
+        )
+
+    def find_duplicates(self) -> list[DuplicateCandidateGroup]:
+        contacts = list(self._iter_all_contacts())
+        if len(contacts) < 2:
+            return []
+
+        indexes: dict[str, dict[str, list[tuple[ContactSummary, DuplicateEvidence]]]] = {
+            "phone": {},
+            "email": {},
+            "name": {},
+            "nickname": {},
+        }
+
+        for contact in contacts:
+            full_name = self._normalize_name_key(contact.name) or self._normalize_name_key(f"{contact.first_name} {contact.last_name}")
+            if full_name:
+                indexes["name"].setdefault(full_name, []).append((contact, DuplicateEvidence(kind="name", value=full_name)))
+
+            for nickname in self._extract_name_tokens(contact):
+                indexes["nickname"].setdefault(nickname, []).append((contact, DuplicateEvidence(kind="nickname", value=nickname)))
+
+            for phone in contact.phones:
+                normalized_phone = self._normalize_lookup_value(phone.value)
+                if normalized_phone:
+                    indexes["phone"].setdefault(normalized_phone, []).append((contact, DuplicateEvidence(kind="phone", value=normalized_phone)))
+
+            for email in contact.emails:
+                normalized_email = self._normalize_lookup_value(email.value)
+                if normalized_email:
+                    indexes["email"].setdefault(normalized_email, []).append((contact, DuplicateEvidence(kind="email", value=normalized_email)))
+
+        grouped: dict[frozenset[str], DuplicateCandidateGroup] = {}
+        for kind, minimum_confidence in (("phone", 0.96), ("email", 0.96), ("name", 0.82), ("nickname", 0.74)):
+            for matches in indexes[kind].values():
+                unique_contacts = {contact.contact_id: contact for contact, _ in matches}
+                if len(unique_contacts) < 2:
+                    continue
+                key = frozenset(unique_contacts)
+                evidence = [item for _, item in matches]
+                if key in grouped:
+                    current = grouped[key]
+                    current_evidence = list(current.evidence)
+                    existing_pairs = {(item.kind, item.value) for item in current_evidence}
+                    for item in evidence:
+                        if (item.kind, item.value) not in existing_pairs:
+                            current_evidence.append(item)
+                    grouped[key] = current.model_copy(
+                        update={
+                            "evidence": current_evidence,
+                            "confidence": min(0.99, max(current.confidence, minimum_confidence) + (0.04 * max(0, len(current_evidence) - 1))),
+                            "merge_recommended": min(0.99, max(current.confidence, minimum_confidence) + (0.04 * max(0, len(current_evidence) - 1))) >= 0.9,
+                        }
+                    )
+                    continue
+                group_key = "|".join(sorted(key))
+                confidence = minimum_confidence + (0.04 * max(0, len(evidence) - 1))
+                grouped[key] = DuplicateCandidateGroup(
+                    duplicate_group_id=hashlib.sha1(group_key.encode("utf-8")).hexdigest()[:12],
+                    confidence=min(0.99, confidence),
+                    evidence=self._dedupe_evidence(evidence),
+                    contacts=list(unique_contacts.values()),
+                    merge_recommended=min(0.99, confidence) >= 0.9,
+                )
+
+        groups = sorted(grouped.values(), key=lambda item: (-item.confidence, item.duplicate_group_id))
+        return groups
+
+    def suggest_merge_candidates(self, query: str | None = None) -> list[DuplicateCandidateGroup]:
+        groups = [group for group in self.find_duplicates() if group.merge_recommended]
+        if not query:
+            return groups
+        normalized_query = query.strip().lower()
+        return [
+            group
+            for group in groups
+            if any(normalized_query in contact.name.lower() for contact in group.contacts)
+            or any(normalized_query in evidence.value.lower() for evidence in group.evidence)
+        ]
+
+    def _choose_recipient(self, contact: ContactDetail, channel: str, *, query: str | None = None) -> tuple[Literal["phone", "email"], ContactMethod]:
+        if query is not None:
+            matched = self._matched_method(contact, channel, query)
+            if matched is not None:
+                return matched
+        if channel == "phone":
+            if contact.phones:
+                return "phone", contact.phones[0]
+            raise ContactsBridgeError(
+                "NO_PHONE_NUMBER",
+                f"Contact '{contact.name}' does not have a phone number.",
+                "Use a different contact or resolve by email instead.",
+            )
+        if channel == "email":
+            if contact.emails:
+                return "email", contact.emails[0]
+            raise ContactsBridgeError(
+                "NO_EMAIL_ADDRESS",
+                f"Contact '{contact.name}' does not have an email address.",
+                "Use a different contact or resolve by phone instead.",
+            )
+        if contact.phones:
+            return "phone", contact.phones[0]
+        if contact.emails:
+            return "email", contact.emails[0]
+        raise ContactsBridgeError(
+            "NO_CONTACT_METHOD",
+            f"Contact '{contact.name}' does not have a phone number or email address.",
+            "Use a different contact.",
+        )
+
+    def _matched_method(self, contact: ContactDetail, channel: str, query: str) -> tuple[Literal["phone", "email"], ContactMethod] | None:
+        """The contact's phone or email that the query names, so the caller gets the method asked for."""
+        if is_email(query):
+            if channel == "phone":
+                return None
+            return next((("email", method) for method in contact.emails if same_email(query, method.value)), None)
+        parts = phone_parts(query)
+        if parts is None or channel == "email":
+            return None
+        normalized_query = normalize_phone(query)
+        matching = sorted(
+            (method for method in contact.phones if same_phone(query, method.value)),
+            key=lambda method: normalize_phone(method.value) != normalized_query,
+        )
+        # same_phone is not transitive (a national number can match two different
+        # international ones), so the matches only count as one number when every
+        # pair of them is the same number.
+        if any(not same_phone(a.value, b.value) for index, a in enumerate(matching) for b in matching[index + 1:]):
+            raise ContactsBridgeError(
+                "AMBIGUOUS_PHONE_NUMBER", f"Multiple phone numbers of '{contact.name}' match '{query.strip()}'.",
+                "Provide the complete phone number, including the country code and any extension.",
+            )
+        if matching:
+            return "phone", matching[0]
+        if parts[1] is not None:
+            raise ContactsBridgeError(
+                "NO_PHONE_NUMBER_MATCH", "No phone method matches the requested extension.",
+                "Choose a matching phone method explicitly.",
+            )
+        return None
+
+    def _iter_all_contacts(self) -> Iterator[ContactSummary]:
+        offset = 0
+        expected_total: int | None = None
+        while expected_total is None or offset < expected_total:
+            payload = self._run_script(
+                "list_contacts.applescript",
+                str(MAX_CONTACTS_PER_REQUEST),
+                str(offset),
+            )
+            raw_total = payload.get("total")
+            if not isinstance(raw_total, int) or isinstance(raw_total, bool) or raw_total < 0:
+                raise ContactsBridgeError(
+                    "INVALID_SCRIPT_OUTPUT",
+                    "The list_contacts AppleScript did not return a valid directory total.",
+                    "Inspect the AppleScript output and try again.",
+                )
+            if raw_total > MAX_DIRECTORY_CONTACTS:
+                raise ContactsBridgeError(
+                    "CONTACT_DIRECTORY_TOO_LARGE",
+                    f"The contact directory contains {raw_total} contacts, above the {MAX_DIRECTORY_CONTACTS}-contact scan limit.",
+                    "Narrow the search by name or reduce the directory size before retrying.",
+                )
+            if expected_total is None:
+                expected_total = raw_total
+            elif raw_total != expected_total:
+                raise ContactsBridgeError(
+                    "CONTACT_DIRECTORY_CHANGED",
+                    "The contact directory changed while it was being scanned.",
+                    "Retry the request after Contacts finishes updating.",
+                )
+
+            raw_items = payload.get("items")
+            if not isinstance(raw_items, list):
+                raise ContactsBridgeError(
+                    "INVALID_SCRIPT_OUTPUT",
+                    "The list_contacts AppleScript did not return an items array.",
+                    "Inspect the AppleScript output and try again.",
+                )
+            items = [self._normalize_summary(item) for item in raw_items if isinstance(item, dict)]
+            remaining = expected_total - offset
+            expected_page_size = min(MAX_CONTACTS_PER_REQUEST, remaining)
+            if len(items) != expected_page_size:
+                raise ContactsBridgeError(
+                    "INCOMPLETE_CONTACT_DIRECTORY",
+                    f"The contact scan returned {len(items)} of {expected_page_size} expected contacts at offset {offset}.",
+                    "Retry the request after Contacts finishes updating.",
+                )
+            yield from items
+            offset += len(items)
+
+    def _run_script(self, script_name: str, *args: str, timeout: float | None = None) -> dict[str, Any]:
+        timeout = SCRIPT_TIMEOUT_SECONDS if timeout is None else timeout
+        if self.helper_source is not None:
+            command = [str(self._ensure_native_helper()), script_name.removesuffix(".applescript"), *args]
+        else:
+            command = ["osascript", str(self.scripts_dir / script_name), *args]
+        script_path = self.scripts_dir / script_name
+        if self.helper_source is None and not script_path.exists():
+            raise ContactsBridgeError(
+                "SCRIPT_NOT_FOUND",
+                f"Missing AppleScript file '{script_name}'.",
+                "Restore the AppleScript file and try again.",
+            )
+
+        try:
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    command,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                )
+                deadline = time.monotonic() + timeout
+                while process.poll() is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._stop_process(process)
+                        raise self._timeout_error(timeout)
+                    if stdout_file.tell() > MAX_SCRIPT_OUTPUT_BYTES or stderr_file.tell() > MAX_SCRIPT_OUTPUT_BYTES:
+                        self._stop_process(process)
+                        raise self._output_too_large_error()
+                    with suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=min(0.05, remaining))
+
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read(MAX_SCRIPT_OUTPUT_BYTES + 1)
+                stderr = stderr_file.read(MAX_SCRIPT_OUTPUT_BYTES + 1)
+                if len(stdout) > MAX_SCRIPT_OUTPUT_BYTES or len(stderr) > MAX_SCRIPT_OUTPUT_BYTES:
+                    raise self._output_too_large_error()
+                returncode = process.returncode
+        except OSError as exc:
+            raise ContactsBridgeError(
+                "HELPER_UNAVAILABLE" if self.helper_source else "OSASCRIPT_UNAVAILABLE",
+                f"Could not run Contacts bridge: {exc}.",
+                "This server requires macOS with osascript available.",
+            ) from exc
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        if returncode != 0:
+            raise self._map_script_error(stderr_text.strip() or stdout_text.strip())
+
+        output = stdout_text.strip()
+        if not output:
+            return {}
+        try:
+            # Legacy AppleScript JSON may contain literal controls in strings.
+            # Python preserves those and complex emoji without grapheme-splitting
+            # escapes; malformed structure and non-object payloads still fail.
+            payload = json.loads(output, strict=False)
+        except json.JSONDecodeError as exc:
+            raise ContactsBridgeError(
+                "INVALID_SCRIPT_OUTPUT",
+                f"AppleScript returned invalid JSON: {exc.msg}.",
+                "Inspect the AppleScript output and ensure it returns valid JSON.",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ContactsBridgeError(
+                "INVALID_SCRIPT_OUTPUT",
+                "AppleScript output must decode to a JSON object.",
+                "Inspect the AppleScript output and ensure it returns an object.",
+            )
+        return payload
+
+    def _timeout_error(self, timeout: float | None = None) -> ContactsBridgeError:
+        timeout = SCRIPT_TIMEOUT_SECONDS if timeout is None else timeout
+        if self.helper_source is None:
+            return ContactsBridgeError(
+                "APPLESCRIPT_TIMEOUT",
+                f"AppleScript exceeded the {timeout:g}-second timeout.",
+                "Ensure Contacts.app is responsive and try again.",
+            )
+        return ContactsBridgeError(
+            "HELPER_TIMEOUT",
+            f"The native Contacts helper exceeded the {timeout:g}-second timeout.",
+            "If a macOS Contacts permission prompt is open, answer it and retry. Otherwise retry with a smaller limit.",
+        )
+
+    def _output_too_large_error(self) -> ContactsBridgeError:
+        source = "AppleScript" if self.helper_source is None else "The native Contacts helper"
+        return ContactsBridgeError(
+            "APPLESCRIPT_OUTPUT_TOO_LARGE" if self.helper_source is None else "HELPER_OUTPUT_TOO_LARGE",
+            f"{source} output exceeded the allowed size.",
+            "Request fewer contacts and try again.",
+        )
+
+    def _ensure_native_helper(self) -> Path:
+        assert self.helper_source is not None and self.helper_build_dir is not None
+        try:
+            binary = ensure_helper_bundle(self.helper_source, self.helper_build_dir, CONTACTS_HELPER_BUNDLE)
+        except NativeHelperError as exc:
+            suggestion = {
+                "HELPER_COMPILE_FAILED": "Install Xcode Command Line Tools, or select APPLE_CONTACTS_MCP_BACKEND=applescript.",
+                "SWIFTC_UNAVAILABLE": "Install Xcode Command Line Tools, or select APPLE_CONTACTS_MCP_BACKEND=applescript.",
+                "HELPER_COMPILE_TIMEOUT": "Check the Swift toolchain, or select the AppleScript backend.",
+                "HELPER_SOURCE_CHANGED": "Retry with the installed source unchanged.",
+            }.get(exc.error_code, exc.suggestion)
+            raise ContactsBridgeError(exc.error_code, str(exc), suggestion) from exc
+        except OSError as exc:
+            raise ContactsBridgeError("HELPER_BUILD_UNAVAILABLE", str(exc), "Check the packaged Swift source, build directory and Xcode Command Line Tools, or select the AppleScript backend.") from exc
+        self._native_binary = binary
+        return binary
+
+    def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
+        with suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                process.kill()
+            process.wait()
+
+    def _search_contacts_by_name(self, query: str, limit: int) -> list[ContactSummary]:
+        if not any(character.isalpha() for character in query):
+            return []
+        payload = self._run_script("search_contacts.applescript", query.strip(), str(limit))
+        return [self._normalize_summary(item) for item in payload.get("items", []) if isinstance(item, dict)]
+
+    def _map_script_error(self, error_text: str) -> ContactsBridgeError:
+        # The native helper reports permission failures as a JSON object naming
+        # the app macOS checked and exactly where to grant access.
+        if error_text.startswith("{"):
+            with suppress(json.JSONDecodeError):
+                payload = json.loads(error_text)
+                if isinstance(payload, dict) and payload.get("error_code"):
+                    suggestion = payload.get("suggestion")
+                    return ContactsBridgeError(
+                        str(payload["error_code"]),
+                        str(payload.get("message") or "The Contacts helper failed."),
+                        str(suggestion) if suggestion else None,
+                    )
+        lowered = error_text.lower()
+        if "notes cannot be written" in lowered:
+            return ContactsBridgeError("CONTACT_NOTE_UNAVAILABLE", error_text, "Leave note empty, or select APPLE_CONTACTS_MCP_BACKEND=applescript.")
+        if "not authorized" in lowered or ("contacts" in lowered and "not allowed" in lowered):
+            return ContactsBridgeError(
+                "PERMISSION_DENIED",
+                "macOS denied access to Contacts.",
+                "Allow Contacts access for the host app or terminal and retry.",
+            )
+        if "can't get person" in lowered or "can’t get person" in lowered:
+            return ContactsBridgeError("CONTACT_NOT_FOUND", error_text, "Search contacts first to discover a valid contact id.")
+        return ContactsBridgeError(
+            "APPLESCRIPT_EXECUTION_FAILED",
+            error_text or "AppleScript execution failed.",
+            "Inspect Contacts.app state and the AppleScript file, then retry.",
+        )
+
+    def _normalize_summary(self, raw_contact: dict[str, Any]) -> ContactSummary:
+        phones = self._normalize_methods(raw_contact.get("phones"))
+        emails = self._normalize_methods(raw_contact.get("emails"))
+        return ContactSummary(
+            contact_id=str(raw_contact.get("contact_id", "")),
+            name=self._optional_text(raw_contact.get("name")) or "",
+            first_name=self._optional_text(raw_contact.get("first_name")) or "",
+            last_name=self._optional_text(raw_contact.get("last_name")) or "",
+            organization=self._optional_text(raw_contact.get("organization")) or "",
+            phone_count=int(raw_contact.get("phone_count", len(phones)) or len(phones)),
+            email_count=int(raw_contact.get("email_count", len(emails)) or len(emails)),
+            phones=phones,
+            emails=emails,
+        )
+
+    def _normalize_detail(self, raw_contact: dict[str, Any]) -> ContactDetail:
+        summary = self._normalize_summary(raw_contact)
+        return ContactDetail(**summary.model_dump(), note=self._optional_text(raw_contact.get("note")) or "")
+
+    def _normalize_methods(self, raw_methods: object) -> list[ContactMethod]:
+        if not isinstance(raw_methods, list):
+            return []
+        return [ContactMethod.model_validate(item) for item in raw_methods if isinstance(item, dict)]
+
+    def _is_exact_match(self, contact: ContactSummary, query_text: str, normalized_query: str) -> bool:
+        parts = self._phone_query_parts(query_text)
+        if parts is not None and parts[1] is not None:
+            # Same rule as every other phone lookup, so two owners of one number
+            # with an extension are both exact and the result is ambiguous.
+            return any(same_phone(query_text, method.value) for method in contact.phones)
+        if query_text in {contact.name.lower(), contact.first_name.lower(), contact.last_name.lower()}:
+            return True
+        if contact.organization and query_text == contact.organization.lower():
+            return True
+        if any(self._normalize_lookup_value(method.value) == normalized_query for method in [*contact.phones, *contact.emails]):
+            return True
+        return parts is not None and any(same_phone(query_text, method.value) for method in contact.phones)
+
+    def _is_partial_match(self, contact: ContactSummary, query_text: str, normalized_query: str) -> bool:
+        parts = self._phone_query_parts(query_text)
+        if parts is not None and parts[1] is not None:
+            return any(self._extension_phone_matches(parts, self._phone_query_parts(method.value)) for method in contact.phones)
+        haystacks = [contact.name, contact.first_name, contact.last_name, contact.organization]
+        if any(query_text in value.lower() for value in haystacks if value):
+            return True
+        if normalized_query and any(normalized_query in self._normalize_lookup_value(method.value) for method in [*contact.phones, *contact.emails]):
+            return True
+        return False
+
+    def _dedupe_contacts(self, contacts: list[ContactSummary]) -> list[ContactSummary]:
+        seen: set[str] = set()
+        result: list[ContactSummary] = []
+        for contact in contacts:
+            if contact.contact_id in seen:
+                continue
+            seen.add(contact.contact_id)
+            result.append(contact)
+        return result
+
+    def lookup_handles(self, handles: list[str]) -> dict[str, ContactSummary]:
+        """Contacts that own the given Messages handles (phone numbers or email addresses).
+
+        Only exact owners are returned: an email must match ignoring case, a phone
+        must be the same number under ``phone_matching.same_phone`` (a missing
+        country calling code is allowed, a different area code is not, and a short
+        code under 7 digits matches digit for digit only). A handle whose owners are
+        two different contacts is left out rather than guessed. Handles with no
+        owner are absent from the result.
+        """
+        wanted: list[str] = []
+        seen: set[str] = set()
+        for handle in handles:
+            key = handle.strip()
+            if key and key not in seen:
+                seen.add(key)
+                wanted.append(key)
+        if not wanted:
+            return {}
+        if self.helper_source is not None:
+            payload = self._run_script("lookup_handles.applescript", json.dumps(wanted), timeout=LOOKUP_HANDLES_TIMEOUT_SECONDS)
+            candidates = [self._normalize_summary(item) for item in payload.get("items", []) if isinstance(item, dict)]
+        else:
+            candidates = list(self._iter_all_contacts())
+        resolved: dict[str, ContactSummary] = {}
+        for handle in wanted:
+            owners: dict[str, ContactSummary] = {}
+            for contact in candidates:
+                if self._owns_handle(contact, handle):
+                    owners.setdefault(contact.contact_id, contact)
+            if len(owners) == 1:
+                resolved[handle] = next(iter(owners.values()))
+        return resolved
+
+    @staticmethod
+    def _owns_handle(contact: ContactSummary, handle: str) -> bool:
+        """Whether one of the contact's methods is the handle under ``phone_matching``."""
+        if "@" in handle:
+            return any(same_email(handle, method.value) for method in contact.emails)
+        return any(same_phone(handle, method.value) for method in contact.phones)
+
+    @staticmethod
+    def _phone_query_parts(value: str) -> tuple[str, str | None] | None:
+        return phone_parts(value)
+
+    @staticmethod
+    def _extension_phone_matches(
+        query_parts: tuple[str, str | None], method_parts: tuple[str, str | None] | None,
+    ) -> bool:
+        return (
+            method_parts is not None
+            and query_parts[1] == method_parts[1]
+            and method_parts[0].endswith(query_parts[0])
+        )
+
+    @staticmethod
+    def _is_short_code(query: str) -> bool:
+        parts = phone_parts(query)
+        return parts is not None and len(parts[0]) < MIN_PHONE_DIGITS
+
+    def _exact_method_matches(self, query: str) -> list[ContactSummary] | None:
+        """Contacts holding the email or phone number given, or None for other queries.
+
+        Phone numbers compare under ``phone_matching.same_phone``, so a short code
+        (under 7 digits) only matches the same digits exactly.
+        """
+        query_text = query.strip()
+        email = is_email(query_text)
+        if not email and phone_parts(query_text) is None:
+            return None
+        return [
+            contact
+            for contact in self._iter_all_contacts()
+            if any(
+                same_email(query_text, method.value) if email else same_phone(query_text, method.value)
+                for method in (contact.emails if email else contact.phones)
+            )
+        ]
+
+    def _normalize_lookup_value(self, value: str) -> str:
+        if "@" in value:
+            return normalize_email(value)
+        return normalize_phone(value) or re.sub(r"\D+", "", value)
+
+    def _normalize_name_key(self, value: str) -> str:
+        lowered = re.sub(r"\s+", " ", value.strip().lower())
+        return re.sub(r"[^a-z0-9() ]+", "", lowered)
+
+    def _extract_name_tokens(self, contact: ContactSummary) -> set[str]:
+        tokens: set[str] = set()
+        for value in (contact.name, contact.first_name, contact.last_name):
+            normalized = self._normalize_name_key(value)
+            if not normalized:
+                continue
+            tokens.add(normalized)
+            for item in re.findall(r"\(([^)]+)\)", normalized):
+                token = item.strip()
+                if token:
+                    tokens.add(token)
+            for item in re.split(r"[() ]+", normalized):
+                token = item.strip()
+                if token:
+                    tokens.add(token)
+        return tokens
+
+    def _dedupe_evidence(self, evidence: list[DuplicateEvidence]) -> list[DuplicateEvidence]:
+        seen: set[tuple[str, str]] = set()
+        result: list[DuplicateEvidence] = []
+        for item in evidence:
+            key = (item.kind, item.value)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    def _serialize_methods(self, methods: list[ContactMethod] | None) -> str:
+        if not methods:
+            return ""
+        rows: list[str] = []
+        for method in methods:
+            # A blank value would replace the whole method set with one empty entry.
+            if not method.value.strip():
+                raise ContactsBridgeError("INVALID_INPUT", "A phone or email value must not be empty.", "Omit the array to keep the current phones or emails, or give every entry a value.")
+            label = method.label.replace(METHOD_FIELD_SEPARATOR, " ").replace(METHOD_RECORD_SEPARATOR, " ")
+            value = method.value.replace(METHOD_FIELD_SEPARATOR, " ").replace(METHOD_RECORD_SEPARATOR, " ")
+            rows.append(f"{label}{METHOD_FIELD_SEPARATOR}{value}")
+        return METHOD_RECORD_SEPARATOR.join(rows)
+
+    def _optional_text(self, value: object) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text.lower() == "missing value":
+            return None
+        return text or None
+
+
+def build_bridge() -> AppleContactsBridge:
+    settings = load_settings()
+    return AppleContactsBridge(
+        settings.scripts_dir,
+        helper_source=settings.helper_source if settings.backend == "native" else None,
+        helper_build_dir=settings.helper_build_dir if settings.backend == "native" else None,
+    )

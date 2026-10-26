@@ -1,0 +1,1008 @@
+"""IndexManager - Central interface for the FTS5 search index.
+
+Provides:
+- build_from_disk(): Pre-index emails by reading .emlx files directly
+- sync_updates(): Incremental sync via JXA for new emails
+- search(): Fast FTS5 search with BM25 ranking
+- get_stats(): Index statistics for status reporting
+
+Thread Safety:
+- Uses threading.Lock for connection management
+- Database connections use check_same_thread=False
+- File watcher runs in separate thread with its own connection
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ..config import (
+    get_index_max_emails,
+    get_index_path,
+    get_index_staleness_hours,
+)
+from .schema import (
+    INSERT_EMAIL_SQL,
+    init_database,
+    insert_attachments,
+    optimize_fts_index,
+    rebuild_fts_index,
+)
+from .search import SearchResult  # Re-use, don't duplicate
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .watcher import IndexWatcher
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class IndexStats:
+    """Statistics about the search index."""
+
+    email_count: int
+    mailbox_count: int
+    last_sync: datetime | None
+    db_size_mb: float
+    staleness_hours: float | None
+    capped_mailboxes: int = 0
+    attachment_count: int = 0
+    disk_email_count: int | None = None
+    failed_jobs_count: int = 0
+    excluded_accounts: list[str] = field(default_factory=list)
+
+
+# SearchResult is imported from .search to avoid duplication
+
+
+class IndexManager:
+    """
+    Manages the FTS5 search index for email body search.
+
+    The index is stored at ~/.apple-mail-mcp/index.db by default.
+    Use environment variables to customize:
+    - APPLE_MAIL_INDEX_PATH: Database location
+    - APPLE_MAIL_INDEX_MAX_EMAILS: Optional per-mailbox cap (default: uncapped)
+    - APPLE_MAIL_INDEX_STALENESS_HOURS: Hours before stale (24)
+
+    Thread Safety:
+    - get_instance() uses class-level lock
+    - _get_conn() uses instance-level lock
+    - Watcher runs in separate thread with its own connection
+    """
+
+    _instance: IndexManager | None = None
+    _instance_lock = threading.Lock()
+
+    # Cache TTL for the disk inventory walk in get_stats(). The walk
+    # is O(N files) and can dominate response latency on >100k
+    # mailboxes (#78). 60s is generous — disk_email_count is a
+    # coverage gauge, not a security-critical value.
+    _DISK_COUNT_TTL_SEC: float = 60.0
+
+    def __init__(self, db_path: Path | None = None):
+        """
+        Initialize the IndexManager.
+
+        Args:
+            db_path: Custom database path (uses config default if None)
+        """
+        self._db_path = db_path or get_index_path()
+        # Cross-process writer role (#106). When False (this process
+        # lost the IndexLock to another instance), sync/watch/build
+        # refuse to run and opportunistic writes become no-ops. Set
+        # by the serve path; orthogonal to the read_only mail flag.
+        self.index_writer: bool = True
+        self._conn: sqlite3.Connection | None = None
+        self._conn_lock = threading.Lock()
+        self._watcher: IndexWatcher | None = None
+        self._watcher_callback: Callable[[int, int], None] | None = None
+        # (count, expiry_monotonic) — None until first successful read.
+        self._disk_count_cache: tuple[int, float] | None = None
+        # Excluded-account UUIDs from the most recent resolution
+        # (build/sync/watcher). Lets JXA-free paths like the disk
+        # email count honor exclusions without their own JXA call.
+        self._exclude_account_uuids: set[str] = set()
+        # Why the most recent sync_updates() could not read the Mail
+        # store, or None if it ran (#110). "permission" = Full Disk
+        # Access denied; "missing" = Mail directory not found. A
+        # blocked sync still returns 0 changes, which is
+        # indistinguishable from "already up to date" without this.
+        self.last_sync_blocked: str | None = None
+
+    def _resolve_exclusions(self) -> set[str]:
+        """Resolve configured account exclusions to UUIDs and remember
+        them for JXA-free consumers (see ``_exclude_account_uuids``).
+        """
+        from .accounts import resolve_excluded_account_uuids
+
+        self._exclude_account_uuids = resolve_excluded_account_uuids()
+        return self._exclude_account_uuids
+
+    @classmethod
+    def get_instance(cls) -> IndexManager:
+        """Get the singleton IndexManager instance (thread-safe)."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = IndexManager()
+            return cls._instance
+
+    @property
+    def db_path(self) -> Path:
+        """Get the database file path."""
+        return self._db_path
+
+    def _require_writer(self, operation: str) -> None:
+        """Raise if this instance is not the index writer.
+
+        Guards the orchestrated write paths (sync/build/rebuild/watch)
+        — reaching them while index-passive is a programming error, not
+        a runtime condition to tolerate.
+        """
+        if not self.index_writer:
+            raise RuntimeError(
+                f"{operation} refused: this instance is index-passive "
+                "(another process holds the index writer lock)"
+            )
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get or create the database connection (thread-safe)."""
+        with self._conn_lock:
+            if self._conn is None:
+                self._conn = init_database(self._db_path)
+            return self._conn
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def has_index(self) -> bool:
+        """Check if an index database exists."""
+        return self._db_path.exists()
+
+    def is_empty(self) -> bool:
+        """Check whether an existing index holds no emails.
+
+        A database file is created before any mail is read, so an
+        index build that ran without Full Disk Access leaves a
+        well-formed but empty index behind. Searching it returns
+        zero rows, which reads exactly like a genuine no-match
+        (#110). Cheaper than :meth:`get_stats`, which also walks
+        the Mail directory.
+
+        Raises:
+            sqlite3.Error: If the index exists but cannot be read.
+        """
+        cursor = self._get_conn().execute("SELECT EXISTS(SELECT 1 FROM emails)")
+        return cursor.fetchone()[0] == 0
+
+    def get_stats(self) -> IndexStats:
+        """
+        Get index statistics.
+
+        Returns:
+            IndexStats with counts, size, and staleness info
+        """
+        conn = self._get_conn()
+
+        # Email count
+        cursor = conn.execute("SELECT COUNT(*) FROM emails")
+        email_count = cursor.fetchone()[0]
+
+        # Mailbox count
+        cursor = conn.execute(
+            "SELECT COUNT(DISTINCT account || '/' || mailbox) FROM emails"
+        )
+        mailbox_count = cursor.fetchone()[0]
+
+        # Last sync time
+        cursor = conn.execute("SELECT MAX(last_sync) FROM sync_state")
+        row = cursor.fetchone()
+        last_sync = None
+        staleness_hours = None
+        if row and row[0]:
+            last_sync = datetime.fromisoformat(row[0])
+            delta = (datetime.now() - last_sync).total_seconds()
+            staleness_hours = delta / 3600
+
+        # Database file size
+        db_size_mb = 0.0
+        if self._db_path.exists():
+            db_size_mb = self._db_path.stat().st_size / (1024 * 1024)
+
+        # Count mailboxes at or above the per-mailbox cap.
+        # Default is uncapped (None) — only query when a cap is set.
+        max_per_mailbox = get_index_max_emails()
+        capped_mailboxes = 0
+        if max_per_mailbox is not None:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                "  SELECT account, mailbox FROM emails"
+                "  GROUP BY account, mailbox"
+                "  HAVING COUNT(*) >= ?"
+                ")",
+                (max_per_mailbox,),
+            )
+            capped_mailboxes = cursor.fetchone()[0]
+
+        # Attachment count
+        cursor = conn.execute("SELECT COUNT(*) FROM attachments")
+        attachment_count = cursor.fetchone()[0]
+
+        # Failed parse jobs count (DLQ)
+        # The table may not exist on a stale connection still on schema v4
+        # — guard with try/except rather than coupling to schema version.
+        failed_jobs_count = 0
+        try:
+            cursor = conn.execute("SELECT COUNT(*) FROM failed_index_jobs")
+            failed_jobs_count = cursor.fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+
+        # Disk email count (best-effort, skip if no FDA). Cached
+        # with a 60s TTL — the underlying disk walk is O(N files)
+        # and would dominate latency for clients polling
+        # `index://status` on a tight loop. (#78)
+        disk_email_count = self._get_disk_email_count_cached()
+
+        # Configured account exclusions (display names — no JXA needed
+        # to report them; resolution to UUIDs happens at index time).
+        from ..config import get_index_exclude_accounts
+
+        excluded_accounts = sorted(get_index_exclude_accounts())
+
+        return IndexStats(
+            email_count=email_count,
+            mailbox_count=mailbox_count,
+            last_sync=last_sync,
+            db_size_mb=db_size_mb,
+            staleness_hours=staleness_hours,
+            capped_mailboxes=capped_mailboxes,
+            attachment_count=attachment_count,
+            disk_email_count=disk_email_count,
+            failed_jobs_count=failed_jobs_count,
+            excluded_accounts=excluded_accounts,
+        )
+
+    def _get_disk_email_count_cached(self) -> int | None:
+        """Return disk email count, walking the filesystem at most
+        once per `_DISK_COUNT_TTL_SEC`. Returns None if Full Disk
+        Access is not granted or the Mail directory is missing.
+        """
+        now = time.monotonic()
+        cache = self._disk_count_cache
+        if cache is not None and cache[1] > now:
+            return cache[0]
+        try:
+            from .disk import find_mail_directory, get_disk_inventory
+
+            mail_dir = find_mail_directory()
+            # Honor exclusions (as last resolved — this path is
+            # JXA-free by design) so the count matches what the
+            # index is allowed to contain (#90).
+            count = len(
+                get_disk_inventory(
+                    mail_dir,
+                    exclude_account_uuids=self._exclude_account_uuids,
+                )
+            )
+        except (FileNotFoundError, PermissionError):
+            # Don't cache failures — the next call should retry in
+            # case Full Disk Access has since been granted.
+            return None
+        self._disk_count_cache = (count, now + self._DISK_COUNT_TTL_SEC)
+        return count
+
+    def invalidate_disk_count_cache(self) -> None:
+        """Drop the cached disk email count. Call after a sync or
+        rebuild that materially changes on-disk state.
+        """
+        self._disk_count_cache = None
+
+    def is_stale(self) -> bool:
+        """Check if the index needs a sync."""
+        stats = self.get_stats()
+        if stats.staleness_hours is None:
+            return True
+        return stats.staleness_hours > get_index_staleness_hours()
+
+    def build_from_disk(
+        self,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+    ) -> int:
+        """
+        Build the index by reading .emlx files directly from disk.
+
+        This requires Full Disk Access permission for the terminal.
+        Much faster than fetching via JXA (~30x faster).
+
+        Args:
+            progress_callback: Optional callback(current, total, message)
+
+        Returns:
+            Number of emails indexed
+
+        Raises:
+            PermissionError: If Full Disk Access is not granted
+            FileNotFoundError: If Mail directory not found
+        """
+        self._require_writer("build_from_disk")
+        from .disk import find_mail_directory, scan_all_emails
+
+        # Verify we can access the mail directory
+        mail_dir = find_mail_directory()
+
+        # Resolve excluded account names -> UUIDs (one JXA call, only
+        # when exclusions are configured) so the JXA-free disk walk can
+        # skip whole accounts. Excluded accounts never enter the index.
+        exclude_account_uuids = self._resolve_exclusions()
+
+        conn = self._get_conn()
+        max_per_mailbox = get_index_max_emails()
+
+        # Track counts per mailbox to enforce limits
+        mailbox_counts: dict[tuple[str, str], int] = {}
+        capped_mailboxes: set[tuple[str, str]] = set()
+        total_indexed = 0
+
+        # Clear existing data for rebuild
+        conn.execute("DELETE FROM attachments")
+        conn.execute("DELETE FROM emails")
+        conn.execute("DELETE FROM sync_state")
+
+        # Disable triggers during bulk insert for performance
+        conn.execute("DROP TRIGGER IF EXISTS emails_ai")
+        conn.execute("DROP TRIGGER IF EXISTS emails_ad")
+        conn.execute("DROP TRIGGER IF EXISTS emails_au")
+
+        batch: list[tuple] = []
+        # Deferred attachment rows: (email_tuple_index, attachments)
+        batch_attachments: list[tuple[int, list]] = []
+        batch_size = 500
+
+        try:
+            for email_data in scan_all_emails(
+                mail_dir, exclude_account_uuids=exclude_account_uuids
+            ):
+                key = (email_data["account"], email_data["mailbox"])
+                count = mailbox_counts.get(key, 0)
+
+                if max_per_mailbox is not None and count >= max_per_mailbox:
+                    capped_mailboxes.add(key)
+                    continue
+
+                mailbox_counts[key] = count + 1
+
+                attachments = email_data.get("attachments", [])
+                batch.append(
+                    (
+                        email_data["id"],
+                        email_data["account"],
+                        email_data["mailbox"],
+                        email_data.get("subject", ""),
+                        email_data.get("sender", ""),
+                        email_data.get("content", ""),
+                        email_data.get("date_received", ""),
+                        email_data.get("emlx_path", ""),
+                        len(attachments),
+                    )
+                )
+                if attachments:
+                    batch_attachments.append((len(batch) - 1, attachments))
+
+                if len(batch) >= batch_size:
+                    self._flush_batch(conn, batch, batch_attachments)
+                    total_indexed += len(batch)
+
+                    if progress_callback:
+                        msg = f"Indexed {total_indexed} emails..."
+                        progress_callback(total_indexed, None, msg)
+
+                    batch = []
+                    batch_attachments = []
+
+        finally:
+            # Flush any remaining partial batch (crash-safe)
+            if batch:
+                self._flush_batch(conn, batch, batch_attachments)
+                total_indexed += len(batch)
+
+            # Update sync state for whatever we managed to index
+            if mailbox_counts:
+                now = datetime.now().isoformat()
+                for (account, mailbox), count in mailbox_counts.items():
+                    conn.execute(
+                        """INSERT OR REPLACE INTO sync_state
+                           (account, mailbox, last_sync, message_count)
+                           VALUES (?, ?, ?, ?)""",
+                        (account, mailbox, now, count),
+                    )
+                conn.commit()
+
+            # Re-enable triggers BEFORE rebuilding FTS to close the
+            # watcher race condition: if the file watcher (or any other
+            # writer) inserts a row after the bulk loop ends but before
+            # the FTS rebuild — or between rebuild and trigger
+            # recreation in the original ordering — that row would land
+            # in `emails` but never enter `emails_fts`. By recreating
+            # triggers first, any concurrent INSERT after this point
+            # fires the trigger normally; the subsequent FTS rebuild
+            # then re-syncs everything in `emails`, double-covering rows
+            # added during the rebuild call itself.
+            conn.executescript("""
+                CREATE TRIGGER IF NOT EXISTS emails_ai
+                AFTER INSERT ON emails BEGIN
+                    INSERT INTO emails_fts(rowid, subject, sender, content)
+                    VALUES (new.rowid, new.subject, new.sender, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS emails_ad
+                AFTER DELETE ON emails BEGIN
+                    INSERT INTO emails_fts(
+                        emails_fts, rowid, subject, sender, content
+                    ) VALUES(
+                        'delete', old.rowid, old.subject,
+                        old.sender, old.content
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS emails_au
+                AFTER UPDATE ON emails BEGIN
+                    INSERT INTO emails_fts(
+                        emails_fts, rowid, subject, sender, content
+                    ) VALUES(
+                        'delete', old.rowid, old.subject,
+                        old.sender, old.content
+                    );
+                    INSERT INTO emails_fts(rowid, subject, sender, content)
+                    VALUES (new.rowid, new.subject, new.sender, new.content);
+                END;
+            """)
+
+            # Rebuild FTS index (must run even if scan crashed
+            # mid-iteration, otherwise emails table has rows
+            # but FTS5 is empty)
+            if total_indexed > 0:
+                if progress_callback:
+                    msg = "Building search index..."
+                    progress_callback(total_indexed, total_indexed, msg)
+
+                rebuild_fts_index(conn)
+                optimize_fts_index(conn)
+
+            # Log cap warnings (aggregate summary)
+            if capped_mailboxes:
+                logger.warning(
+                    "%d mailbox(es) hit the per-mailbox cap (%d). "
+                    "Increase APPLE_MAIL_INDEX_MAX_EMAILS to index more.",
+                    len(capped_mailboxes),
+                    max_per_mailbox,
+                )
+                if progress_callback:
+                    msg = (
+                        f"Warning: {len(capped_mailboxes)} mailbox(es) "
+                        f"hit cap ({max_per_mailbox})"
+                    )
+                    progress_callback(total_indexed, total_indexed, msg)
+
+        # Disk inventory just changed — drop the cache so the next
+        # status call reflects truth.
+        self.invalidate_disk_count_cache()
+        return total_indexed
+
+    @staticmethod
+    def _flush_batch(
+        conn: sqlite3.Connection,
+        batch: list[tuple],
+        batch_attachments: list[tuple[int, list]],
+    ) -> None:
+        """Insert a batch of emails and their attachment metadata.
+
+        Attachment-bearing rows insert individually so
+        cursor.lastrowid links the attachment rows without a
+        post-hoc SELECT per email (INSERT OR REPLACE always yields
+        a fresh rowid); the attachment-free majority keeps the
+        executemany fast path.
+        """
+        with_attachments = {idx for idx, _ in batch_attachments}
+        plain = [
+            row for i, row in enumerate(batch) if i not in with_attachments
+        ]
+        if plain:
+            conn.executemany(INSERT_EMAIL_SQL, plain)
+
+        for idx, attachments in batch_attachments:
+            cursor = conn.execute(INSERT_EMAIL_SQL, batch[idx])
+            if cursor.lastrowid is not None:
+                insert_attachments(conn, cursor.lastrowid, attachments)
+
+        conn.commit()
+
+    def sync_updates(
+        self,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+    ) -> int:
+        """
+        Sync index with disk using state reconciliation.
+
+        Compares the filesystem with the database to detect:
+        - New emails (on disk, not in DB)
+        - Deleted emails (in DB, not on disk)
+        - Moved emails (same ID, different path)
+
+        This is much faster than the old JXA-based sync (~30x faster)
+        and handles deletions correctly.
+
+        Args:
+            progress_callback: Optional callback(current, total, message)
+
+        Returns:
+            Number of changes (added + deleted + moved)
+        """
+        self._require_writer("sync_updates")
+        from .disk import find_mail_directory
+        from .sync import sync_from_disk
+
+        try:
+            mail_dir = find_mail_directory()
+        except (FileNotFoundError, PermissionError) as e:
+            # Record *why* before returning 0 — callers otherwise
+            # report a blocked sync as "index up to date" (#110).
+            self.last_sync_blocked = (
+                "permission" if isinstance(e, PermissionError) else "missing"
+            )
+            logger.warning("Cannot access mail directory for sync: %s", e)
+            return 0
+
+        self.last_sync_blocked = None
+        exclude_account_uuids = self._resolve_exclusions()
+
+        result = sync_from_disk(
+            self._get_conn(),
+            mail_dir,
+            progress_callback,
+            exclude_account_uuids=exclude_account_uuids,
+        )
+        # Disk inventory just changed (or was just verified) — drop
+        # the get_stats cache so the next status call reflects truth.
+        self.invalidate_disk_count_cache()
+        return result.total_changes
+
+    def search(
+        self,
+        query: str,
+        account: str | None = None,
+        mailbox: str | None = None,
+        limit: int = 20,
+        exclude_mailboxes: list[str] | None = None,
+        exclude_accounts: list[str] | None = None,
+        column: str | None = None,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        offset: int = 0,
+        highlight: bool = False,
+    ) -> list[SearchResult]:
+        """
+        Search indexed emails using FTS5.
+
+        Args:
+            query: Search query (supports FTS5 syntax)
+            account: Optional account filter
+            mailbox: Optional mailbox filter
+            limit: Maximum results (default: 20)
+            exclude_mailboxes: Mailboxes to exclude from results
+            column: Optional FTS5 column filter ("subject", "sender",
+                or "content")
+            before: Exclude emails on/after this date (YYYY-MM-DD)
+            after: Include emails on/after this date (YYYY-MM-DD)
+            offset: Skip first N results (default: 0)
+            highlight: Use FTS5 highlight/snippet for results
+
+        Returns:
+            List of SearchResult ordered by relevance (BM25 score)
+        """
+        from .search import search_fts, search_fts_highlight
+
+        search_fn = search_fts_highlight if highlight else search_fts
+        return search_fn(
+            self._get_conn(),
+            query,
+            account=account,
+            mailbox=mailbox,
+            limit=limit,
+            column=column,
+            exclude_mailboxes=exclude_mailboxes,
+            exclude_accounts=exclude_accounts,
+            before=before,
+            after=after,
+            offset=offset,
+        )
+
+    def rebuild(
+        self,
+        account: str | None = None,
+        mailbox: str | None = None,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+    ) -> int:
+        """
+        Force rebuild of the index.
+
+        Args:
+            account: Optional account to rebuild (all if None)
+            mailbox: Optional mailbox to rebuild (all in account if None)
+            progress_callback: Optional progress callback
+
+        Returns:
+            Number of emails re-indexed
+        """
+        self._require_writer("rebuild")
+        conn = self._get_conn()
+
+        # Delete existing entries for rebuild scope
+        if account and mailbox:
+            conn.execute(
+                "DELETE FROM emails WHERE account = ? AND mailbox = ?",
+                (account, mailbox),
+            )
+        elif account:
+            conn.execute("DELETE FROM emails WHERE account = ?", (account,))
+        else:
+            conn.execute("DELETE FROM emails")
+
+        conn.commit()
+
+        # Rebuild from disk
+        return self.build_from_disk(progress_callback)
+
+    def get_indexed_message_ids(
+        self, account: str | None = None, mailbox: str | None = None
+    ) -> set[int]:
+        """
+        Get all message IDs currently in the index.
+
+        Note: Message IDs are only unique within (account, mailbox).
+
+        Args:
+            account: Optional account filter
+            mailbox: Optional mailbox filter
+
+        Returns:
+            Set of message IDs
+        """
+        conn = self._get_conn()
+
+        if account and mailbox:
+            sql = """SELECT message_id FROM emails
+                     WHERE account = ? AND mailbox = ?"""
+            cursor = conn.execute(sql, (account, mailbox))
+        elif account:
+            cursor = conn.execute(
+                "SELECT message_id FROM emails WHERE account = ?", (account,)
+            )
+        else:
+            cursor = conn.execute("SELECT message_id FROM emails")
+
+        return {row[0] for row in cursor}
+
+    # ─────────────────────────────────────────────────────────────────
+    # Public Query Methods (used by server.py instead of raw SQL)
+    # ─────────────────────────────────────────────────────────────────
+
+    def find_email_location(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Look up an email's (account, mailbox) from the index.
+
+        Used by get_email Strategy 2 to find where an email lives
+        without iterating all mailboxes via JXA.
+
+        Args:
+            message_id: Mail.app message ID
+            account: Optional account filter (UUID)
+            mailbox: Optional mailbox filter
+
+        Returns:
+            (account, mailbox) tuple or None if not found
+        """
+        conn = self._get_conn()
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+
+        sql = (
+            "SELECT account, mailbox FROM emails WHERE "
+            + " AND ".join(where)
+            + " LIMIT 1"
+        )
+        row = conn.execute(sql, params).fetchone()
+        if row:
+            return (row["account"], row["mailbox"])
+        return None
+
+    def find_email_path(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> Path | None:
+        """Look up an email's .emlx file path from the index.
+
+        Used by get_attachment to locate the file on disk.
+
+        Args:
+            message_id: Mail.app message ID
+            account: Optional account filter (UUID)
+            mailbox: Optional mailbox filter
+
+        Returns:
+            Path to the .emlx file, or None if not found / path is NULL
+        """
+        conn = self._get_conn()
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+
+        sql = (
+            "SELECT emlx_path FROM emails WHERE "
+            + " AND ".join(where)
+            + " LIMIT 1"
+        )
+        row = conn.execute(sql, params).fetchone()
+        if row and row["emlx_path"]:
+            return Path(row["emlx_path"])
+        return None
+
+    def delete_email(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> int:
+        """Delete a single email entry from the index.
+
+        Used to clean up stale entries when the indexed `.emlx` file
+        no longer exists on disk (the message was deleted or moved
+        between syncs). The `AFTER DELETE ON emails` trigger handles
+        FTS5 cleanup; the `attachments` table cascades via
+        `ON DELETE CASCADE`.
+
+        Args:
+            message_id: Mail.app message ID
+            account: Optional account filter (UUID) — narrows the
+                delete when the same message_id appears in multiple
+                accounts (rare).
+            mailbox: Optional mailbox filter
+
+        Returns:
+            Number of rows deleted (typically 0 or 1).
+        """
+        # Opportunistic cleanup reachable from read paths (get_email
+        # stale-entry handling) — when index-passive, skip and let the
+        # writer's sync/watcher reconcile.
+        if not self.index_writer:
+            logger.debug("delete_email skipped (index-passive): %s", message_id)
+            return 0
+        conn = self._get_conn()
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+
+        sql = "DELETE FROM emails WHERE " + " AND ".join(where)
+        cursor = conn.execute(sql, params)
+        conn.commit()
+        return cursor.rowcount
+
+    def record_parse_failure(
+        self,
+        emlx_path: str,
+        account: str,
+        mailbox: str,
+        error: BaseException,
+    ) -> None:
+        """Record an `.emlx` parse failure into the dead letter queue.
+
+        Idempotent — repeated failures on the same path bump
+        `attempt_count` and refresh `last_seen` / `error_*` columns
+        without losing `first_seen`.
+        """
+        if not self.index_writer:
+            logger.debug(
+                "record_parse_failure skipped (index-passive): %s",
+                emlx_path,
+            )
+            return
+        from .schema import RECORD_PARSE_FAILURE_SQL, parse_failure_row
+
+        conn = self._get_conn()
+        conn.execute(
+            RECORD_PARSE_FAILURE_SQL,
+            parse_failure_row(emlx_path, account, mailbox, error),
+        )
+        conn.commit()
+
+    def clear_parse_failure(self, emlx_path: str) -> int:
+        """Remove a path from the dead letter queue (e.g. after a
+        successful retry). Returns the number of rows removed.
+        """
+        if not self.index_writer:
+            logger.debug(
+                "clear_parse_failure skipped (index-passive): %s",
+                emlx_path,
+            )
+            return 0
+        from .schema import CLEAR_PARSE_FAILURE_SQL
+
+        conn = self._get_conn()
+        cursor = conn.execute(CLEAR_PARSE_FAILURE_SQL, (emlx_path,))
+        conn.commit()
+        return cursor.rowcount
+
+    def search_attachments(
+        self,
+        query: str,
+        account: str | None = None,
+        mailbox: str | None = None,
+        limit: int = 20,
+        exclude_mailboxes: list[str] | None = None,
+        exclude_accounts: list[str] | None = None,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search attachments by filename using SQL LIKE.
+
+        Args:
+            query: Filename search term (matched with LIKE %query%)
+            account: Optional account filter (UUID)
+            mailbox: Optional mailbox filter
+            limit: Maximum results
+            exclude_mailboxes: Mailboxes to exclude from results
+            before: Exclude emails on/after this date (YYYY-MM-DD)
+            after: Include emails on/after this date (YYYY-MM-DD)
+            offset: Skip first N results (default: 0)
+
+        Returns:
+            List of dicts with message_id, account, mailbox,
+            subject, sender, date_received, filename
+        """
+        from .search import search_attachments as _search_attachments
+
+        return _search_attachments(
+            self._get_conn(),
+            query,
+            account=account,
+            mailbox=mailbox,
+            limit=limit,
+            exclude_mailboxes=exclude_mailboxes,
+            exclude_accounts=exclude_accounts,
+            before=before,
+            after=after,
+            offset=offset,
+        )
+
+    def get_email_attachments(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> list[dict] | None:
+        """Get attachment metadata for an email from the index.
+
+        Returns richer MIME-parsed attachment data than JXA's
+        mailAttachments(), including inline images and S/MIME parts.
+
+        Args:
+            message_id: Mail.app message ID
+            account: Optional account filter (UUID)
+            mailbox: Optional mailbox filter
+
+        Returns:
+            List of attachment dicts, or None if email not found
+        """
+        conn = self._get_conn()
+        where = ["e.message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("e.account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("e.mailbox = ?")
+            params.append(mailbox)
+
+        sql = (
+            "SELECT a.filename, a.mime_type, a.file_size, a.content_id "
+            "FROM attachments a "
+            "JOIN emails e ON a.email_rowid = e.rowid "
+            "WHERE " + " AND ".join(where)
+        )
+        cursor = conn.execute(sql, params)
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+        return [
+            {
+                "filename": r["filename"],
+                "mime_type": r["mime_type"],
+                "size": r["file_size"] or 0,
+                "content_id": r["content_id"],
+            }
+            for r in rows
+        ]
+
+    # ─────────────────────────────────────────────────────────────────
+    # File Watcher Methods
+    # ─────────────────────────────────────────────────────────────────
+
+    def start_watcher(
+        self,
+        on_update: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """
+        Start the file watcher for real-time index updates.
+
+        Watches ~/Library/Mail/V10/ for .emlx changes and automatically
+        updates the index when emails are added or deleted.
+
+        Args:
+            on_update: Optional callback(added_count, removed_count)
+                       called after each batch of changes
+
+        Returns:
+            True if watcher started, False if already running or failed
+        """
+        self._require_writer("start_watcher")
+        if self._watcher is not None and self._watcher.is_running:
+            return False
+
+        from .watcher import IndexWatcher
+
+        self._watcher_callback = on_update
+        self._watcher = IndexWatcher(
+            db_path=self._db_path,
+            on_update=on_update,
+            exclude_account_uuids=self._resolve_exclusions(),
+        )
+
+        return self._watcher.start()
+
+    def stop_watcher(self) -> None:
+        """Stop the file watcher if running."""
+        if self._watcher is not None:
+            self._watcher.stop()
+            self._watcher = None
+
+    @property
+    def watcher_running(self) -> bool:
+        """Check if the file watcher is running."""
+        return self._watcher is not None and self._watcher.is_running

@@ -1,0 +1,264 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from macpilot_mcp.vendor_common.native import HelperBundle, NativeHelperError, ensure_helper_bundle, helper_bundle_executable
+from macpilot_mcp.vendor_reed.reminders.config import load_settings
+from macpilot_mcp.vendor_reed.reminders.models import (
+    DeleteReminderListResponse,
+    ReminderDetail,
+    ReminderListInfo,
+    ReminderListMutationResponse,
+    ReminderSummary,
+)
+
+
+class RemindersBridgeError(Exception):
+    def __init__(self, error_code: str, message: str, suggestion: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.message = message
+        self.suggestion = suggestion
+
+
+# macOS only shows a Reminders prompt for an app whose Info.plist explains the access,
+# and remembers the answer by bundle identifier and signature. A bare command-line
+# helper has neither, so it could never be granted access in its own right.
+REMINDERS_HELPER_BUNDLE = HelperBundle(
+    executable="apple-reminders-pim-bridge",
+    display_name="Apple Reminders MCP Helper",
+    bundle_identifier="io.github.jonathanrreed.apple-mcps.reminders-pim-bridge",
+    usage_descriptions={
+        "NSRemindersUsageDescription": "Apple Reminders MCP reads and changes reminders when your AI assistant asks it to.",
+        "NSRemindersFullAccessUsageDescription": "Apple Reminders MCP reads and changes reminders when your AI assistant asks it to.",
+    },
+)
+
+
+class RemindersBridge:
+    def __init__(self, helper_source: Path, helper_build_dir: Path) -> None:
+        self.helper_source = helper_source
+        self.helper_build_dir = helper_build_dir
+        self.helper_binary: Path | None = None
+
+    def helper_available(self) -> tuple[bool, bool]:
+        source_available = self.helper_source.exists()
+        return source_available, source_available and helper_bundle_executable(self.helper_source, self.helper_build_dir, REMINDERS_HELPER_BUNDLE).is_file()
+
+    def access_status(self) -> dict[str, Any]:
+        """Read Reminders authorization without requesting it."""
+        return self._run_helper("reminders-access-status")
+
+    def list_lists(self) -> list[ReminderListInfo]:
+        payload = self._run_helper("list-reminder-lists")
+        return [ReminderListInfo.model_validate(item) for item in payload.get("items", [])]
+
+    def create_list(self, title: str) -> ReminderListMutationResponse:
+        payload = self._run_helper("create-reminder-list", json.dumps({"title": title}))
+        return ReminderListMutationResponse.model_validate(payload)
+
+    def list_reminders(
+        self,
+        *,
+        list_id: str | None = None,
+        include_completed: bool = True,
+        limit: int = 100,
+        search: str | None = None,
+        due_after: str | None = None,
+        due_before: str | None = None,
+    ) -> list[ReminderSummary]:
+        request = {
+            "list_id": list_id,
+            "include_completed": include_completed,
+            "limit": limit,
+            "search": search,
+            "due_after": due_after,
+            "due_before": due_before,
+        }
+        payload = self._run_helper("list-reminders", json.dumps(request))
+        return [self._to_summary(item) for item in payload.get("items", [])]
+
+    def get_reminder(self, reminder_id: str) -> ReminderDetail:
+        payload = self._run_helper("get-reminder", reminder_id)
+        return ReminderDetail.model_validate(payload)
+
+    def create_reminder(
+        self,
+        *,
+        title: str,
+        list_id: str,
+        notes: str | None = None,
+        due_date: str | None = None,
+        due_all_day: bool = False,
+        remind_at: str | None = None,
+        priority: int = 0,
+        parent_reminder_id: str | None = None,
+        tags: list[str] | None = None,
+    ) -> ReminderDetail:
+        combined_notes = notes or ""
+        if tags:
+            tag_str = " ".join(f"#{t.lstrip('#')}" for t in tags)
+            combined_notes = f"{combined_notes}\n\n{tag_str}".strip()
+
+        request = {
+            "title": title,
+            "list_id": list_id,
+            "notes": combined_notes or None,
+            "due_date": due_date,
+            "due_all_day": due_all_day,
+            "remind_at": remind_at,
+            "priority": priority,
+        }
+        if parent_reminder_id is not None:
+            raise self._subtasks_unsupported()
+        payload = self._run_helper("create-reminder", json.dumps(request))
+        return ReminderDetail.model_validate(payload)
+
+    def update_reminder(
+        self,
+        reminder_id: str,
+        *,
+        title: str | None = None,
+        list_id: str | None = None,
+        notes: str | None = None,
+        due_date: str | None = None,
+        due_all_day: bool | None = None,
+        remind_at: str | None = None,
+        priority: int | None = None,
+        completed: bool | None = None,
+        parent_reminder_id: str | None = None,
+        tags: list[str] | None = None,
+    ) -> ReminderDetail:
+        request: dict[str, object] = {}
+        if title is not None:
+            request["title"] = title
+        if list_id is not None:
+            request["list_id"] = list_id
+        if due_date is not None:
+            request["due_date"] = due_date
+        if due_all_day is not None:
+            request["due_all_day"] = due_all_day
+        if remind_at is not None:
+            request["remind_at"] = remind_at
+        if priority is not None:
+            request["priority"] = priority
+        if completed is not None:
+            request["completed"] = completed
+
+        # Handle notes and tags
+        if notes is not None or tags is not None:
+            combined_notes = notes
+            if combined_notes is None:
+                # Need to fetch the current note to append tags properly without overwriting
+                current = self.get_reminder(reminder_id)
+                combined_notes = current.notes or ""
+            if tags:
+                tag_str = " ".join(f"#{t.lstrip('#')}" for t in tags)
+                combined_notes = f"{combined_notes}\n\n{tag_str}".strip()
+            request["notes"] = combined_notes
+
+        if parent_reminder_id is not None:
+            raise self._subtasks_unsupported()
+        payload = self._run_helper("update-reminder", reminder_id, json.dumps(request))
+        return ReminderDetail.model_validate(payload)
+
+    def set_completed(self, reminder_id: str, completed: bool) -> ReminderDetail:
+        payload = self._run_helper("set-reminder-completed", reminder_id, "true" if completed else "false")
+        return ReminderDetail.model_validate(payload)
+
+    def delete_reminder(self, reminder_id: str) -> bool:
+        payload = self._run_helper("delete-reminder", reminder_id)
+        return bool(payload.get("deleted", False))
+
+    def delete_list(self, list_id: str) -> DeleteReminderListResponse:
+        payload = self._run_helper("delete-reminder-list", list_id)
+        return DeleteReminderListResponse.model_validate({**payload, "list_id": payload["object_id"]})
+
+    def _run_helper(self, command: str, *args: str) -> dict[str, Any]:
+        helper_binary = self._ensure_helper()
+        try:
+            completed = subprocess.run(
+                [str(helper_binary), command, *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise RemindersBridgeError(
+                "HELPER_UNAVAILABLE",
+                f"Could not run the native helper '{helper_binary}': {exc}.",
+                "This server requires macOS with the compiled Reminders helper available.",
+            ) from exc
+        output = completed.stdout.strip()
+        if completed.returncode != 0:
+            self._raise_helper_error(output, completed.stderr.strip())
+
+        if not output:
+            return {}
+
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise RemindersBridgeError(
+                "INVALID_HELPER_OUTPUT",
+                f"Native helper returned invalid JSON: {exc.msg}.",
+                "Inspect the helper output and retry.",
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise RemindersBridgeError(
+                "INVALID_HELPER_OUTPUT",
+                "Native helper output must be a JSON object.",
+                "Inspect the helper output and retry.",
+            )
+        return payload
+
+    def _ensure_helper(self) -> Path:
+        if not self.helper_source.exists():
+            raise RemindersBridgeError(
+                "HELPER_SOURCE_MISSING",
+                f"Missing native helper source at '{self.helper_source}'.",
+                "Restore the shared Swift helper and retry.",
+            )
+        try:
+            helper_binary = ensure_helper_bundle(self.helper_source, self.helper_build_dir, REMINDERS_HELPER_BUNDLE)
+            self.helper_binary = helper_binary
+            return helper_binary
+        except NativeHelperError as exc:
+            raise RemindersBridgeError(exc.error_code, str(exc), exc.suggestion or "Confirm Xcode command line tools and Swift are available, then retry.") from exc
+
+    def _raise_helper_error(self, stdout_text: str, stderr_text: str) -> None:
+        if stdout_text:
+            try:
+                payload = json.loads(stdout_text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                raise RemindersBridgeError(
+                    str(payload.get("error_code", "HELPER_EXECUTION_FAILED")),
+                    str(payload.get("message", "Native helper execution failed.")),
+                    payload.get("suggestion"),
+                )
+        raise RemindersBridgeError(
+            "HELPER_EXECUTION_FAILED",
+            stderr_text or stdout_text or "Native helper execution failed.",
+            "Inspect helper stderr and retry.",
+        )
+
+    def _to_summary(self, payload: object) -> ReminderSummary:
+        return ReminderSummary.model_validate(payload)
+
+    def _subtasks_unsupported(self) -> RemindersBridgeError:
+        return RemindersBridgeError(
+            "SUBTASKS_UNSUPPORTED",
+            "Apple Reminders subtasks are not available through the public APIs used by this MCP.",
+            "Create a top-level reminder instead, or omit parent_reminder_id.",
+        )
+
+
+def build_bridge() -> RemindersBridge:
+    settings = load_settings()
+    return RemindersBridge(settings.helper_source, settings.helper_build_dir)

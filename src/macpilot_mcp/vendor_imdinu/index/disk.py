@@ -1,0 +1,1285 @@
+"""Direct disk reading of Apple Mail .emlx files.
+
+This module reads emails directly from ~/Library/Mail/V10/ for fast indexing.
+Requires Full Disk Access permission for the terminal.
+
+Mail.app storage structure:
+    ~/Library/Mail/V10/
+    ├── [Account-UUID]/
+    │   └── [Mailbox].mbox/
+    │       └── Data/x/y/Messages/
+    │           ├── 12345.emlx
+    │           └── 12346.emlx
+    └── MailData/
+        └── Envelope Index    # SQLite with metadata
+
+.emlx file format:
+    1255                      ← Byte count of MIME content
+    From: sender@example.com  ← RFC 5322 headers + body
+    Subject: Hello
+    ...
+    <?xml version="1.0"?>     ← Plist metadata footer
+    <plist>...</plist>
+"""
+
+from __future__ import annotations
+
+import email
+import logging
+import mimetypes
+import plistlib
+import re
+import sqlite3
+import warnings
+from dataclasses import dataclass
+from email.header import decode_header, make_header
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+# Mail.app version folder (V10 for macOS Catalina+)
+# Deprecated: use find_mail_directory() which auto-detects.
+MAIL_VERSION = "V10"
+
+# Cached result of find_mail_directory()
+_cached_mail_dir: Path | None = None
+
+
+def _detect_mail_version() -> str:
+    """Auto-detect the highest Mail.app version directory.
+
+    Scans ``~/Library/Mail/`` for directories matching ``V<number>``
+    and returns the highest version (e.g. ``"V11"`` if V10 and V11
+    both exist).  Falls back to ``"V10"`` if none are found.
+
+    Returns:
+        Version string like ``"V10"`` or ``"V11"``.
+    """
+    mail_base = Path.home() / "Library" / "Mail"
+    if not mail_base.is_dir():
+        return MAIL_VERSION
+
+    versions: list[tuple[int, str]] = []
+    try:
+        for entry in mail_base.iterdir():
+            if (
+                entry.is_dir()
+                and entry.name.startswith("V")
+                and entry.name[1:].isdigit()
+            ):
+                versions.append((int(entry.name[1:]), entry.name))
+    except PermissionError:
+        return MAIL_VERSION
+
+    if not versions:
+        return MAIL_VERSION
+
+    # Return highest version
+    versions.sort()
+    return versions[-1][1]
+
+
+def extract_message_id(path: Path) -> int:
+    """Extract the numeric message ID from an .emlx filename.
+
+    Handles both regular (``12345.emlx``) and partial
+    (``12345.partial.emlx``) filenames by splitting on the first dot.
+
+    Args:
+        path: Path to an .emlx file
+
+    Returns:
+        Integer message ID
+
+    Raises:
+        ValueError: If the filename does not start with a number
+    """
+    return int(path.name.split(".")[0])
+
+
+# Maximum email file size to prevent OOM from malformed/huge files (25 MB)
+MAX_EMLX_SIZE = 25 * 1024 * 1024
+
+
+@dataclass
+class AttachmentInfo:
+    """Metadata for a single email attachment."""
+
+    filename: str
+    mime_type: str
+    file_size: int
+    content_id: str | None
+
+
+@dataclass
+class EmlxEmail:
+    """Parsed email from .emlx file."""
+
+    id: int
+    subject: str
+    sender: str
+    content: str
+    date_received: str
+    emlx_path: Path
+    attachments: list[AttachmentInfo] | None = None
+    # Extended fields (populated by parse_emlx when available)
+    read: bool | None = None
+    flagged: bool | None = None
+    date_sent: str = ""
+    reply_to: str = ""
+    message_id_header: str = ""
+
+
+def find_mail_directory() -> Path:
+    """
+    Find the Apple Mail data directory.
+
+    Auto-detects the highest ``V*`` version directory under
+    ``~/Library/Mail/``.  The result is cached for the lifetime
+    of the process.
+
+    Returns:
+        Path to the Mail data directory (e.g. ``~/Library/Mail/V10/``)
+
+    Raises:
+        FileNotFoundError: If directory doesn't exist
+        PermissionError: If Full Disk Access is not granted
+    """
+    global _cached_mail_dir
+    if _cached_mail_dir is not None:
+        return _cached_mail_dir
+
+    version = _detect_mail_version()
+    mail_dir = Path.home() / "Library" / "Mail" / version
+
+    if not mail_dir.exists():
+        raise FileNotFoundError(
+            f"Mail directory not found: {mail_dir}\n"
+            "Ensure Apple Mail has been used on this Mac."
+        )
+
+    # Test access by trying to list contents
+    try:
+        next(mail_dir.iterdir(), None)
+    except PermissionError as e:
+        raise PermissionError(
+            f"Cannot access {mail_dir}\n"
+            "Grant Full Disk Access to Terminal:\n"
+            "  System Settings → Privacy & Security → "
+            "Full Disk Access"
+        ) from e
+
+    _cached_mail_dir = mail_dir
+    return mail_dir
+
+
+def find_envelope_index(mail_dir: Path) -> Path:
+    """
+    Find the Envelope Index SQLite database.
+
+    Args:
+        mail_dir: Path to ~/Library/Mail/V10/
+
+    Returns:
+        Path to the Envelope Index database
+
+    Raises:
+        FileNotFoundError: If database not found
+    """
+    # The Envelope Index is in MailData directory
+    envelope_path = mail_dir.parent / "MailData" / "Envelope Index"
+
+    if not envelope_path.exists():
+        raise FileNotFoundError(
+            f"Envelope Index not found: {envelope_path}\n"
+            "Ensure Apple Mail has synced email."
+        )
+
+    return envelope_path
+
+
+def read_envelope_index(mail_dir: Path) -> dict[int, dict]:
+    """
+    Read the Envelope Index database to get message metadata.
+
+    The Envelope Index contains:
+    - Message IDs and their file paths
+    - Account and mailbox information
+    - Basic metadata (subject, sender, dates)
+
+    Args:
+        mail_dir: Path to ~/Library/Mail/V10/
+
+    Returns:
+        Dict mapping message ID to metadata dict with:
+        - account: Account name
+        - mailbox: Mailbox name
+        - emlx_path: Path to .emlx file (relative)
+        - subject: Email subject
+        - sender: Sender address
+        - date_received: ISO date string
+    """
+    envelope_path = find_envelope_index(mail_dir)
+
+    # Connect in read-only mode to avoid locking issues
+    conn = sqlite3.connect(f"file:{envelope_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+
+    result: dict[int, dict] = {}
+
+    try:
+        # Query the messages table joined with mailboxes
+        # Schema varies by macOS version, so we use a flexible approach
+        cursor = conn.execute("""
+            SELECT
+                m.ROWID as id,
+                m.subject,
+                m.sender,
+                m.date_received,
+                m.mailbox as mailbox_id,
+                mb.url as mailbox_url
+            FROM messages m
+            LEFT JOIN mailboxes mb ON m.mailbox = mb.ROWID
+            ORDER BY m.date_received DESC
+        """)
+
+        for row in cursor:
+            msg_id = row["id"]
+
+            # Parse mailbox URL to get account and mailbox name
+            # Format: mailbox://[account-uuid]/[mailbox-name]
+            mailbox_url = row["mailbox_url"] or ""
+            account, mailbox = _parse_mailbox_url(mailbox_url)
+
+            result[msg_id] = {
+                "account": account,
+                "mailbox": mailbox,
+                "subject": row["subject"] or "",
+                "sender": row["sender"] or "",
+                "date_received": _format_timestamp(row["date_received"]),
+            }
+
+    except sqlite3.OperationalError as e:
+        # Schema might be different, try alternative approach
+        if "no such table" in str(e).lower():
+            # Fallback to scanning .emlx files directly
+            pass
+        else:
+            raise
+    finally:
+        conn.close()
+
+    return result
+
+
+def _parse_mailbox_url(url: str) -> tuple[str, str]:
+    """
+    Parse a mailbox URL to extract account and mailbox names.
+
+    Args:
+        url: mailbox://account-uuid/mailbox-name
+
+    Returns:
+        (account_name, mailbox_name) tuple
+    """
+    if not url:
+        return ("Unknown", "Unknown")
+
+    # Remove mailbox:// prefix
+    path = url.replace("mailbox://", "")
+
+    # Split by /
+    parts = path.split("/", 1)
+
+    if len(parts) >= 2:
+        account = parts[0] or "Unknown"
+        mailbox = parts[1] or "Unknown"
+        return (account, mailbox)
+
+    return (parts[0] if parts else "Unknown", "Unknown")
+
+
+def _format_timestamp(timestamp: float | int | None) -> str:
+    """Convert Core Data timestamp to ISO string."""
+    if timestamp is None:
+        return ""
+
+    # Core Data timestamps are seconds since Jan 1, 2001
+    # Convert to Unix timestamp (seconds since Jan 1, 1970)
+    import datetime
+
+    CORE_DATA_EPOCH = 978307200  # Jan 1, 2001 in Unix time
+
+    try:
+        unix_ts = timestamp + CORE_DATA_EPOCH
+        dt = datetime.datetime.fromtimestamp(unix_ts, tz=datetime.UTC)
+        return dt.isoformat()
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
+def parse_emlx(path: Path) -> EmlxEmail | None:
+    """
+    Parse a single .emlx file.
+
+    .emlx format:
+    1. First line: byte count of MIME content
+    2. MIME message (RFC 5322)
+    3. XML plist footer with Apple metadata
+
+    Args:
+        path: Path to .emlx file
+
+    Returns:
+        EmlxEmail with parsed content, or None if parsing fails
+    """
+    try:
+        # Check file size to prevent OOM from huge/malformed files
+        if path.stat().st_size > MAX_EMLX_SIZE:
+            return None
+
+        content = path.read_bytes()
+
+        # Find the byte count on first line
+        newline_idx = content.find(b"\n")
+        if newline_idx == -1:
+            return None
+
+        try:
+            byte_count = int(content[:newline_idx].strip())
+        except ValueError:
+            return None
+
+        # Extract MIME content
+        mime_start = newline_idx + 1
+        mime_end = mime_start + byte_count
+        mime_content = content[mime_start:mime_end]
+
+        # Parse MIME message
+        msg = email.message_from_bytes(mime_content)
+
+        # Extract subject with proper decoding
+        subject = ""
+        if msg["Subject"]:
+            try:
+                subject = str(make_header(decode_header(msg["Subject"])))
+            except (UnicodeDecodeError, LookupError):
+                subject = msg["Subject"] or ""
+
+        # Extract sender
+        sender = msg["From"] or ""
+        if sender:
+            try:
+                sender = str(make_header(decode_header(sender)))
+            except (UnicodeDecodeError, LookupError):
+                pass
+
+        # Extract received date from Received header (delivery time)
+        # Falls back to Date header if no Received header exists
+        date_received = ""
+        received_header = msg["Received"]
+        if received_header:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                # RFC 5322: Received header ends with "; <date>"
+                semicolon_idx = received_header.rfind(";")
+                if semicolon_idx != -1:
+                    date_part = received_header[semicolon_idx + 1 :].strip()
+                    dt = parsedate_to_datetime(date_part)
+                    date_received = dt.isoformat()
+            except (ValueError, TypeError):
+                pass
+        if not date_received and msg["Date"]:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                dt = parsedate_to_datetime(msg["Date"])
+                date_received = dt.isoformat()
+            except (ValueError, TypeError):
+                date_received = msg["Date"]
+
+        # Extract body text
+        body = _extract_body_text(msg)
+
+        # Extract attachment metadata
+        attachments = _extract_attachments(msg, emlx_path=path)
+
+        # Extract message ID from filename (handles .partial.emlx)
+        msg_id = extract_message_id(path)
+
+        # Extract sent date from Date header (composition time)
+        date_sent = ""
+        if msg["Date"]:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                dt = parsedate_to_datetime(msg["Date"])
+                date_sent = dt.isoformat()
+            except (ValueError, TypeError):
+                date_sent = msg["Date"]
+
+        reply_to = ""
+        if msg["Reply-To"]:
+            try:
+                reply_to = str(make_header(decode_header(msg["Reply-To"])))
+            except (UnicodeDecodeError, LookupError):
+                reply_to = msg["Reply-To"] or ""
+
+        message_id_header = msg.get("Message-ID", "") or ""
+
+        # Extract read/flagged from plist footer flags bitmask
+        read = None
+        flagged = None
+        plist_data = content[mime_end:]
+        if plist_data.strip():
+            try:
+                plist = plistlib.loads(plist_data)
+                flags = plist.get("flags", 0)
+                read = bool(flags & (1 << 0))
+                flagged = bool(flags & (1 << 4))
+                if not date_received:
+                    ts = plist.get("date-received")
+                    if ts:
+                        from datetime import datetime
+
+                        dt = datetime.fromtimestamp(ts, tz=datetime.UTC)
+                        date_received = dt.isoformat()
+            except Exception:
+                pass  # Plist parsing is best-effort
+
+        return EmlxEmail(
+            id=msg_id,
+            subject=subject,
+            sender=sender,
+            content=body,
+            date_received=date_received,
+            emlx_path=path,
+            attachments=attachments or None,
+            read=read,
+            flagged=flagged,
+            date_sent=date_sent,
+            reply_to=reply_to,
+            message_id_header=message_id_header,
+        )
+
+    except (OSError, ValueError, UnicodeDecodeError, LookupError):
+        # Skip malformed files
+        return None
+
+
+def _extract_body_text(msg: email.message.Message) -> str:
+    """
+    Extract plain text body from email message.
+
+    Handles multipart messages, preferring text/plain over text/html.
+    """
+    if msg.is_multipart():
+        text_parts = []
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        decoded = payload.decode(charset, errors="replace")
+                        text_parts.append(decoded)
+                    except (UnicodeDecodeError, LookupError):
+                        decoded = payload.decode("utf-8", errors="replace")
+                        text_parts.append(decoded)
+        if text_parts:
+            return "\n".join(text_parts)
+
+        # Fallback to HTML if no plain text
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        html = payload.decode(charset, errors="replace")
+                        return _strip_html(html)
+                    except (UnicodeDecodeError, LookupError):
+                        pass
+        return ""
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="replace")
+                if msg.get_content_type() == "text/html":
+                    return _strip_html(text)
+                return text
+            except (UnicodeDecodeError, LookupError):
+                return payload.decode("utf-8", errors="replace")
+        return ""
+
+
+def _strip_html(html: str) -> str:
+    """
+    Robust HTML to text conversion.
+
+    Uses selectolax (lexbor C parser) for ~5x faster stripping than
+    BeautifulSoup on realistic email HTML. Falls back to BeautifulSoup
+    if selectolax raises — this path also covers environments where the
+    selectolax C extension didn't install. A real HTML parser (vs.
+    regex) is required to prevent XSS-style bypass via malformed HTML
+    like `<<script>` or unbalanced nesting.
+    """
+    text: str | None = None
+
+    # Fast path: selectolax
+    try:
+        from selectolax.parser import HTMLParser
+
+        tree = HTMLParser(html)
+        for tag in tree.css("script, style"):
+            tag.decompose()
+        body = tree.body
+        text = body.text(separator="\n", strip=True) if body else ""
+    except Exception:
+        text = None
+
+    # Fallback: BeautifulSoup
+    if text is None:
+        try:
+            from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", category=XMLParsedAsHTMLWarning
+                )
+                soup = BeautifulSoup(html, "html.parser")
+            for element in soup(["script", "style"]):
+                element.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+        except Exception:
+            # Both parsers failed — return empty string so a single bad
+            # email doesn't crash the scan.
+            return ""
+
+    # Common post-processing: collapse runs of whitespace.
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+    text = re.sub(r" +", " ", text)
+    return text.strip()
+
+
+def _estimate_attachment_size(part: email.message.Message) -> int:
+    """Estimate decoded attachment size without full MIME decode.
+
+    Avoids allocating the full decoded binary during indexing by
+    computing the size from the encoded payload and transfer encoding.
+
+    Strategy:
+    1. Use ``Content-Length`` header if present (rare but exact).
+    2. Compute from encoded payload length and encoding type:
+       - base64 → ``(clean_len * 3) // 4``
+       - quoted-printable / 7bit / 8bit → encoded length (≈ decoded)
+    3. Fallback to 0.
+    """
+    # 1. Explicit Content-Length header (rare but exact)
+    cl = part.get("Content-Length")
+    if cl:
+        try:
+            return int(cl)
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Compute from encoded payload
+    raw = part.get_payload(decode=False)
+    if not raw or not isinstance(raw, str):
+        return 0
+
+    encoding = (part.get("Content-Transfer-Encoding") or "").lower().strip()
+
+    if encoding == "base64":
+        # Compute clean length without intermediate copies. (#81)
+        # `str.count` iterates but allocates nothing; chained
+        # `replace()` would allocate ~3x the payload size, e.g. ~80
+        # MB of GC churn on a 20 MB attachment.
+        whitespace = raw.count("\n") + raw.count("\r") + raw.count(" ")
+        clean_len = len(raw) - whitespace
+        if clean_len == 0:
+            return 0
+        # Count trailing '=' padding without rstrip() allocation.
+        end = len(raw)
+        while end > 0 and raw[end - 1] in " \n\r\t":
+            end -= 1
+        padding = 0
+        while padding < end and raw[end - 1 - padding] == "=":
+            padding += 1
+        return (clean_len * 3) // 4 - padding
+    else:
+        # QP, 7bit, 8bit — encoded length ≈ decoded length
+        return len(raw)
+
+
+def _mime_part_numbers(
+    msg: email.message.Message,
+) -> dict[int, str]:
+    """Map ``id(part)`` to MIME part-number strings.
+
+    Top-level children of a multipart message are numbered
+    ``"1"``, ``"2"``, etc.  Nested children use dot notation
+    (``"2.1"``, ``"2.2"``), mirroring the subdirectory names
+    Apple Mail uses under ``Attachments/<msg_id>/``.
+    """
+    result: dict[int, str] = {}
+
+    def _walk(part: email.message.Message, prefix: list[str]) -> None:
+        if part.is_multipart():
+            for i, child in enumerate(part.get_payload(), 1):
+                _walk(child, [*prefix, str(i)])
+        else:
+            result[id(part)] = ".".join(prefix)
+
+    if msg.is_multipart():
+        for i, child in enumerate(msg.get_payload(), 1):
+            _walk(child, [str(i)])
+    else:
+        result[id(msg)] = "1"
+
+    return result
+
+
+def _find_external_attachment(
+    emlx_path: Path,
+    msg_id: int,
+    part_idx: int | str,
+    filename: str,
+) -> Path | None:
+    """Find an externally-stored attachment on disk.
+
+    Apple Mail stores external attachments for ``.partial.emlx``
+    files in a sibling ``Attachments`` directory::
+
+        .../Data/9/4/Messages/49461.partial.emlx
+        .../Data/9/4/Attachments/49461/2/file.jpeg        (top-level)
+        .../Data/9/4/Attachments/49461/2.2/file.pdf       (nested)
+
+    Args:
+        emlx_path: Path to the ``.emlx`` file.
+        msg_id: Numeric message ID extracted from *emlx_path*.
+        part_idx: MIME part number (e.g. ``2`` or ``"2.2"``),
+            matching the subdirectory under ``Attachments/<msg_id>/``.
+        filename: Target filename to look for.
+
+    Returns:
+        Path to the external file, or ``None`` if not found.
+    """
+    # Navigate: Messages/ -> parent -> Attachments/<msg_id>/
+    attachments_dir = emlx_path.parent.parent / "Attachments" / str(msg_id)
+    if not attachments_dir.is_dir():
+        return None
+
+    # Part sub-directories are 1-based: 2/, 3/, 4/, …
+    # The part_idx we receive is already 1-based.
+    part_dir = attachments_dir / str(part_idx)
+    if not part_dir.is_dir():
+        return None
+
+    # Strategy 1: exact filename match
+    # Guard against path traversal from untrusted MIME filenames
+    # (e.g. filename="../../etc/passwd")
+    candidate = part_dir / filename
+    try:
+        if not candidate.resolve().is_relative_to(part_dir.resolve()):
+            return None
+    except PermissionError:
+        raise
+    except (ValueError, OSError):
+        return None
+    if candidate.is_file():
+        return candidate
+
+    # Strategy 2: take the single file in the subdirectory
+    # (each part subdir has exactly one file, sometimes with
+    # a generic name like "Mail Attachment.jpeg").
+    try:
+        files = [f for f in part_dir.iterdir() if f.is_file()]
+    except PermissionError:
+        raise
+    except OSError:
+        return None
+
+    if len(files) == 1:
+        return files[0]
+
+    return None
+
+
+def _synthetic_inline_name(content_id: str, mime_type: str) -> str:
+    """Build a stable filename for an inline part that has a
+    Content-ID but no MIME filename (common in multipart/related
+    HTML email — embedded logos, badges, marketing graphics).
+
+    Both _extract_attachments() and get_attachment_content() derive
+    the name from the same inputs, so the synthetic filename is
+    addressable for retrieval. The cid is sanitized because it lands
+    in a user-visible filename. (#86)
+    """
+    ext = mimetypes.guess_extension(mime_type) or ""
+    safe_cid = re.sub(r"[^A-Za-z0-9._-]", "_", content_id)
+    # Content-IDs often already carry an extension (e.g.
+    # "logo.png") — appending the mime ext would double it
+    # ("inline_logo.png.png"). Skip when the cid's own suffix
+    # already maps to the same mime type.
+    guessed, _ = mimetypes.guess_type(safe_cid)
+    if guessed == mime_type:
+        ext = ""
+    return f"inline_{safe_cid}{ext}"
+
+
+def _extract_attachments(
+    msg: email.message.Message,
+    *,
+    emlx_path: Path | None = None,
+) -> list[AttachmentInfo]:
+    """Extract attachment metadata from an email message.
+
+    Walks MIME parts and collects non-inline, non-text parts
+    (or inline parts with Content-ID, i.e. embedded images).
+
+    When *emlx_path* is provided and the estimated size is 0
+    (common for ``.partial.emlx`` with external attachments),
+    the function tries to stat the external file to get an
+    accurate size.
+
+    Args:
+        msg: Parsed email message
+        emlx_path: Optional path to the ``.emlx`` file on
+            disk, used to locate external attachments.
+
+    Returns:
+        List of AttachmentInfo with filename, mime_type,
+        size, content_id
+    """
+    attachments: list[AttachmentInfo] = []
+
+    if not msg.is_multipart():
+        return attachments
+
+    # Resolve msg_id once if we might need external lookup
+    msg_id: int | None = None
+    if emlx_path is not None:
+        try:
+            msg_id = extract_message_id(emlx_path)
+        except ValueError:
+            pass
+
+    part_numbers = _mime_part_numbers(msg)
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        disposition = str(part.get("Content-Disposition") or "")
+
+        # Skip multipart containers and plain text/html body
+        if part.get_content_maintype() == "multipart":
+            continue
+        if content_type in ("text/plain", "text/html") and (
+            "attachment" not in disposition.lower()
+        ):
+            continue
+
+        content_id = part.get("Content-ID")
+        if content_id:
+            # Strip angle brackets: <cid123> → cid123
+            content_id = content_id.strip("<>")
+
+        filename = part.get_filename() or ""
+        if not filename:
+            if "attachment" not in disposition.lower() and not content_id:
+                continue
+            if content_id:
+                # Inline part with Content-ID but no filename —
+                # synthesize one so the part stays addressable. (#86)
+                filename = _synthetic_inline_name(content_id, content_type)
+
+        file_size = _estimate_attachment_size(part)
+
+        # Fallback: stat external file for .partial.emlx
+        if file_size == 0 and emlx_path is not None and msg_id is not None:
+            part_number = part_numbers.get(id(part))
+            # An empty/missing part number would route the lookup to the
+            # Attachments root rather than a specific subdir (Path / "" ==
+            # Path), silently returning the wrong file. Skip rather than
+            # misroute.
+            if part_number:
+                ext = _find_external_attachment(
+                    emlx_path,
+                    msg_id,
+                    part_number,
+                    filename,
+                )
+                if ext is not None:
+                    try:
+                        file_size = ext.stat().st_size
+                    except OSError:
+                        pass
+
+        attachments.append(
+            AttachmentInfo(
+                filename=filename,
+                mime_type=content_type,
+                file_size=file_size,
+                content_id=content_id,
+            )
+        )
+
+    return attachments
+
+
+def get_attachment_content(
+    emlx_path: Path, target_filename: str
+) -> tuple[bytes, str] | None:
+    """
+    Extract a specific attachment's content from an .emlx file.
+
+    Args:
+        emlx_path: Path to the .emlx file
+        target_filename: Filename of the attachment to extract
+
+    Returns:
+        (raw_bytes, mime_type) tuple, or None if not found
+
+    Raises:
+        PermissionError: The email file exists but cannot be read
+            (typically missing Full Disk Access). Distinct from the
+            ``None`` "not found" return so callers can report the
+            real cause (#109).
+    """
+    try:
+        # stat() rather than an exists() pre-check: Path.exists()
+        # returns False on EACCES, which would turn a permission
+        # denial into "not found" before the read is even attempted.
+        if emlx_path.stat().st_size > MAX_EMLX_SIZE:
+            return None
+
+        content = emlx_path.read_bytes()
+        newline_idx = content.find(b"\n")
+        if newline_idx == -1:
+            return None
+
+        byte_count = int(content[:newline_idx].strip())
+        mime_start = newline_idx + 1
+        mime_end = mime_start + byte_count
+        msg = email.message_from_bytes(content[mime_start:mime_end])
+
+        # Walk MIME parts, using MIME part numbers for
+        # external-file fallback.
+        part_numbers = _mime_part_numbers(msg)
+        for part in msg.walk():
+            ct = part.get_content_type()
+            disp = str(part.get("Content-Disposition") or "")
+
+            if part.get_content_maintype() == "multipart":
+                continue
+            if ct in ("text/plain", "text/html") and (
+                "attachment" not in disp.lower()
+            ):
+                continue
+
+            cid = part.get("Content-ID")
+            if cid:
+                cid = cid.strip("<>")
+
+            fname = part.get_filename() or ""
+            if not fname:
+                if "attachment" not in disp.lower() and not cid:
+                    continue
+                if cid:
+                    # Same synthetic name _extract_attachments()
+                    # advertised for this part. (#86)
+                    fname = _synthetic_inline_name(cid, ct)
+
+            if fname.strip().lower() != target_filename.strip().lower():
+                continue
+
+            # Primary path: embedded MIME payload
+            payload = part.get_payload(decode=True)
+            if payload:
+                return (payload, ct)
+
+            # Fallback: external file on disk
+            part_number = part_numbers.get(id(part))
+            if part_number is None:
+                continue
+            result = _read_external_attachment(
+                emlx_path,
+                part_number,
+                target_filename,
+            )
+            if result is not None:
+                return result
+
+        return None
+    except PermissionError:
+        raise
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _read_external_attachment(
+    emlx_path: Path,
+    part_number: int | str,
+    target_filename: str,
+) -> tuple[bytes, str] | None:
+    """Read an external attachment file from disk.
+
+    Helper for :func:`get_attachment_content` that locates
+    and reads the external file stored alongside a
+    ``.partial.emlx``.
+
+    Args:
+        emlx_path: Path to the ``.emlx`` file.
+        part_number: MIME part number (e.g. ``2`` or ``"2.2"``).
+        target_filename: Filename to find.
+
+    Returns:
+        ``(bytes, mime_type)`` or ``None``.
+    """
+    try:
+        msg_id = extract_message_id(emlx_path)
+    except ValueError:
+        return None
+
+    ext_path = _find_external_attachment(
+        emlx_path,
+        msg_id,
+        part_number,
+        target_filename,
+    )
+    if ext_path is None:
+        return None
+
+    try:
+        if ext_path.stat().st_size > MAX_EMLX_SIZE:
+            return None
+        data = ext_path.read_bytes()
+    except PermissionError:
+        raise
+    except OSError:
+        return None
+
+    mime_type, _ = mimetypes.guess_type(ext_path.name)
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+    return (data, mime_type)
+
+
+# Maximum URL length to keep (skip tracking/redirect URLs)
+_MAX_LINK_LENGTH = 200
+# Schemes to skip
+_SKIP_SCHEMES = frozenset(("mailto", "javascript", "tel", "sms", "data", "cid"))
+
+
+@dataclass
+class LinkInfo:
+    """A hyperlink extracted from an email."""
+
+    url: str
+    text: str
+
+
+def get_email_links(emlx_path: Path) -> list[LinkInfo]:
+    """
+    Extract hyperlinks from an email's HTML parts.
+
+    Parses the MIME structure, finds text/html parts, and extracts
+    ``<a href>`` links. Filters out mailto:, javascript:, and
+    very long tracking URLs.
+
+    Args:
+        emlx_path: Path to the .emlx file
+
+    Returns:
+        List of LinkInfo with url and anchor text, deduplicated
+        by URL.
+
+    Raises:
+        PermissionError: The email file exists but cannot be read
+            (typically missing Full Disk Access). Distinct from the
+            empty "no links" return so callers can report the real
+            cause (#109).
+    """
+    try:
+        # stat() rather than an exists() pre-check: Path.exists()
+        # returns False on EACCES, which would turn a permission
+        # denial into "no links" before the read is even attempted.
+        if emlx_path.stat().st_size > MAX_EMLX_SIZE:
+            return []
+
+        content = emlx_path.read_bytes()
+        newline_idx = content.find(b"\n")
+        if newline_idx == -1:
+            return []
+
+        byte_count = int(content[:newline_idx].strip())
+        mime_start = newline_idx + 1
+        mime_end = mime_start + byte_count
+        msg = email.message_from_bytes(content[mime_start:mime_end])
+
+        return _extract_links_from_message(msg)
+    except PermissionError:
+        raise
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+
+
+def _extract_links_from_message(
+    msg: email.message.Message,
+) -> list[LinkInfo]:
+    """Extract deduplicated links from HTML parts of a message."""
+    try:
+        from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    except ImportError:
+        return []
+
+    seen_urls: set[str] = set()
+    links: list[LinkInfo] = []
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+
+    for part in parts:
+        if part.get_content_type() != "text/html":
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            html = payload.decode(charset, errors="replace")
+        except (UnicodeDecodeError, LookupError):
+            html = payload.decode("utf-8", errors="replace")
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+            soup = BeautifulSoup(html, "html.parser")
+
+        for a_tag in soup.find_all("a", href=True):
+            url = a_tag["href"].strip()
+            if not url:
+                continue
+
+            # Skip unwanted schemes
+            scheme = url.split(":", 1)[0].lower()
+            if scheme in _SKIP_SCHEMES:
+                continue
+
+            # Skip very long tracking URLs
+            if len(url) > _MAX_LINK_LENGTH:
+                continue
+
+            # Deduplicate by URL
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            text = a_tag.get_text(strip=True) or ""
+            links.append(LinkInfo(url=url, text=text))
+
+    return links
+
+
+def scan_emlx_files(
+    mail_dir: Path,
+    exclude_mailboxes: set[str] | None = None,
+    exclude_account_uuids: set[str] | None = None,
+) -> Iterator[Path]:
+    """
+    Find all .emlx files in the Mail directory.
+
+    Args:
+        mail_dir: Path to ~/Library/Mail/V10/
+        exclude_mailboxes: Mailbox names to skip (e.g. {"Drafts"}).
+            Uses APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES config if None.
+        exclude_account_uuids: Account UUIDs (the on-disk folder names)
+            to skip entirely. Must be pre-resolved by the caller from
+            configured account *names* — this layer is JXA-free and the
+            name↔UUID map only exists via JXA. None/empty = no account
+            exclusion.
+
+    Yields:
+        Paths to .emlx files
+    """
+    if exclude_mailboxes is None:
+        from ..config import get_index_exclude_mailboxes
+
+        exclude_mailboxes = get_index_exclude_mailboxes()
+
+    # .emlx files are in: account-uuid/mailbox.mbox/Data/x/y/Messages/
+    for emlx_path in mail_dir.rglob("*.emlx"):
+        if exclude_mailboxes or exclude_account_uuids:
+            parts = emlx_path.relative_to(mail_dir).parts
+            # parts[0] is the account UUID directory.
+            if (
+                exclude_account_uuids
+                and parts
+                and parts[0] in exclude_account_uuids
+            ):
+                continue
+            # parts[1] is the "<mailbox>.mbox" directory.
+            if exclude_mailboxes and len(parts) > 1:
+                mbox_dir = parts[1]
+                mbox_name = (
+                    mbox_dir[:-5] if mbox_dir.endswith(".mbox") else mbox_dir
+                )
+                if mbox_name in exclude_mailboxes:
+                    continue
+
+        yield emlx_path
+
+
+def scan_all_emails(
+    mail_dir: Path,
+    exclude_account_uuids: set[str] | None = None,
+) -> Iterator[dict]:
+    """
+    Scan all emails from the Mail directory.
+
+    This combines the Envelope Index metadata with .emlx file content
+    for comprehensive email data.
+
+    Args:
+        mail_dir: Path to ~/Library/Mail/V10/
+        exclude_account_uuids: Account UUIDs to skip entirely (see
+            :func:`scan_emlx_files`). None/empty = no account exclusion.
+
+    Yields:
+        Email dicts with: id, account, mailbox, subject, sender,
+        content, date_received, emlx_path
+    """
+    # First, try to read metadata from Envelope Index
+    try:
+        metadata = read_envelope_index(mail_dir)
+    except (FileNotFoundError, sqlite3.Error):
+        metadata = {}
+
+    # Scan .emlx files and combine with metadata
+    for emlx_path in scan_emlx_files(
+        mail_dir, exclude_account_uuids=exclude_account_uuids
+    ):
+        try:
+            parsed = parse_emlx(emlx_path)
+        except Exception as e:
+            logger.warning("Skipping corrupt file %s: %s", emlx_path, e)
+            continue
+        if not parsed:
+            continue
+
+        msg_id = parsed.id
+
+        # Get metadata from Envelope Index if available
+        meta = metadata.get(msg_id, {})
+
+        # Infer account/mailbox from path if not in metadata
+        if not meta:
+            account, mailbox = _infer_account_mailbox(emlx_path, mail_dir)
+            meta = {"account": account, "mailbox": mailbox}
+
+        yield {
+            "id": msg_id,
+            "account": meta.get("account", "Unknown"),
+            "mailbox": meta.get("mailbox", "Unknown"),
+            "subject": parsed.subject or meta.get("subject", ""),
+            "sender": parsed.sender or meta.get("sender", ""),
+            "content": parsed.content,
+            "date_received": meta.get("date_received") or parsed.date_received,
+            "emlx_path": str(emlx_path),
+            "attachments": parsed.attachments or [],
+        }
+
+
+def iter_disk_inventory(
+    mail_dir: Path,
+    exclude_account_uuids: set[str] | None = None,
+) -> Iterator[tuple[str, str, int, str]]:
+    """Stream the disk inventory as `(account, mailbox, msg_id, path)` tuples.
+
+    Streaming variant of `get_disk_inventory()`. Use when you don't need
+    O(1) lookups and want bounded memory — e.g. bulk-loading into a
+    SQL temp table for diffing.
+
+    Yields tuples instead of building a full dict. Files with non-numeric
+    or unparseable names are skipped silently. ``exclude_account_uuids``
+    skips whole accounts (see :func:`scan_emlx_files`).
+    """
+    for emlx_path in scan_emlx_files(
+        mail_dir, exclude_account_uuids=exclude_account_uuids
+    ):
+        try:
+            msg_id = extract_message_id(emlx_path)
+            account, mailbox = _infer_account_mailbox(emlx_path, mail_dir)
+        except (ValueError, AttributeError):
+            continue
+        yield (account, mailbox, msg_id, str(emlx_path))
+
+
+def get_disk_inventory(
+    mail_dir: Path,
+    exclude_account_uuids: set[str] | None = None,
+) -> dict[tuple[str, str, int], str]:
+    """
+    Fast inventory of all emails on disk WITHOUT parsing content.
+
+    This walks the filesystem and extracts (account, mailbox, message_id)
+    from file paths. Much faster than scan_all_emails() since it doesn't
+    read file content.
+
+    Path structure:
+        V10/[account-uuid]/[mailbox].mbox/Data/.../Messages/[id].emlx
+
+    Args:
+        mail_dir: Path to ~/Library/Mail/V10/
+        exclude_account_uuids: Account UUIDs to skip entirely (see
+            :func:`scan_emlx_files`). None/empty = no account exclusion.
+
+    Returns:
+        Dict mapping (account, mailbox, msg_id) -> emlx_path string
+    """
+    return {
+        (account, mailbox, msg_id): path
+        for account, mailbox, msg_id, path in iter_disk_inventory(
+            mail_dir, exclude_account_uuids=exclude_account_uuids
+        )
+    }
+
+
+def _infer_account_mailbox(emlx_path: Path, mail_dir: Path) -> tuple[str, str]:
+    """
+    Infer account and mailbox from .emlx file path.
+
+    Handles nested mailboxes like Work/Projects/Q1.mbox by scanning
+    forward to find the first .mbox-ending path component.
+
+    Path structure: V10/account-uuid/[nested/]mailbox.mbox/Data/.../id.emlx
+    """
+    try:
+        relative = emlx_path.relative_to(mail_dir)
+        parts = relative.parts
+
+        # First part is account UUID
+        account = parts[0] if parts else "Unknown"
+
+        # Find the part ending with .mbox — may span multiple components
+        # e.g. parts = ("UUID", "Work", "Projects", "Q1.mbox", "Data", ...)
+        mailbox = "Unknown"
+        for i, part in enumerate(parts[1:], start=1):
+            if part.endswith(".mbox"):
+                # Join components from parts[1] to parts[i], strip .mbox
+                components = (*parts[1:i], part[:-5])
+                mailbox = "/".join(components)
+                break
+
+        return (account, mailbox)
+    except ValueError:
+        return ("Unknown", "Unknown")
