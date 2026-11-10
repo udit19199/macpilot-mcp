@@ -21,9 +21,9 @@ uv run macpilot-mcp serve --transport streamable-http --port 8765
 
 ```
 # Claude Code
-claude mcp add --transport stdio macpilot -- uv run --directory ~/Workspace/personal/macpilot-mcp macpilot-mcp serve
-# Codex: [mcp_servers.macpilot] command="uv" args=["run","--directory","/Users/uditagarwal19199/Workspace/personal/macpilot-mcp","macpilot-mcp","serve"]
-# OpenCode opencode.json: "mcp": {"macpilot": {"type": "local", "command": ["uv","run","--directory","/Users/uditagarwal19199/Workspace/personal/macpilot-mcp","macpilot-mcp","serve"]}}
+claude mcp add --transport stdio macpilot -- uv run --directory ~/Workspace/projects/macpilot-mcp macpilot-mcp serve
+# Codex: [mcp_servers.macpilot] command="uv" args=["run","--directory","/Users/uditagarwal19199/Workspace/projects/macpilot-mcp","macpilot-mcp","serve"]
+# OpenCode opencode.json: "mcp": {"macpilot": {"type": "local", "command": ["uv","run","--directory","/Users/uditagarwal19199/Workspace/projects/macpilot-mcp","macpilot-mcp","serve"]}}
 ```
 
 ## Checks
