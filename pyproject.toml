@@ -1,11 +1,11 @@
 [project]
 name = "macpilot-mcp"
 version = "0.1.0"
-description = "Unified local Apple Mail + Calendar + Reminders + Contacts MCP — FTS5 mail search, runtime-independent stdio/HTTP."
+description = "Local MCP server for Apple Mail, Calendar, Reminders and Contacts on macOS with FTS5 mail search."
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.11"
-authors = [{ name = "macpilot-mcp contributors" }]
+authors = [{ name = "Udit Agarwal" }]
 keywords = ["apple-mail", "mcp", "fts5", "macos", "calendar", "reminders", "contacts"]
 dependencies = [
   "fastmcp>=3.0.0",
@@ -32,3 +32,9 @@ exclude = ["src/macpilot_mcp/vendor_imdinu", "src/macpilot_mcp/vendor_freyer", "
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]

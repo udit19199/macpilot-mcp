@@ -113,7 +113,7 @@ async def mail_get_links(message_id: str) -> list:
 
 @mcp.tool()
 async def mail_index_rebuild(mailbox: str | None = None) -> dict:
-    """(Re)build the FTS5 index from disk. Run once, then --watch keeps it fresh."""
+    """(Re)build the FTS5 index from disk. Run again when the index is stale."""
     from .vendor_imdinu.index.manager import IndexManager
 
     mgr = IndexManager()

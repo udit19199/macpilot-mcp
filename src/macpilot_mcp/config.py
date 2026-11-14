@@ -44,3 +44,7 @@ def mirror_env_for_vendors() -> None:
         os.environ["APPLE_MAIL_INDEX_PATH"] = path
     elif "APPLE_MAIL_INDEX_PATH" not in os.environ:
         os.environ["APPLE_MAIL_INDEX_PATH"] = str(DEFAULT_INDEX_PATH)
+
+    profile = os.environ.get("MACPILOT_SAFETY_PROFILE")
+    if profile and "APPLE_MAIL_MCP_SAFETY_PROFILE" not in os.environ:
+        os.environ["APPLE_MAIL_MCP_SAFETY_PROFILE"] = profile
